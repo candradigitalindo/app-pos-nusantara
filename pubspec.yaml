@@ -1,0 +1,63 @@
+name: pos_resto
+description: Aplikasi POS Restoran - Android Tablet
+publish_to: 'none'
+version: 1.2.0+3
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # State Management
+  flutter_riverpod: ^2.5.1
+
+  # Database
+  sqflite: ^2.3.3
+  path_provider: ^2.1.3
+  path: ^1.9.0
+
+  # Network (cloud sync)
+  dio: ^5.4.3+1
+
+  # UI
+  cupertino_icons: ^1.0.8
+
+  # Logo struk: pilih gambar dari galeri + proses (resize & monokrom 1-bit).
+  # Diproses & disimpan LOKAL agar cetak tetap jalan tanpa internet.
+  image_picker: ^1.1.2
+  image: ^4.3.0
+
+  # Local API Server (waiter station)
+  shelf: ^1.4.1
+  shelf_router: ^1.1.4
+  shelf_web_socket: ^1.0.4
+  web_socket_channel: ^2.4.0
+
+  # Printer
+  print_bluetooth_thermal: ^1.0.12
+  network_info_plus: ^8.1.0
+  permission_handler: ^12.0.1
+
+  # Utils
+  intl: ^0.19.0
+  crypto: ^3.0.3
+  shared_preferences: ^2.2.3
+
+  # Telemetri perangkat (heartbeat: baterai, versi app). Model/OS/penyimpanan
+  # via MethodChannel native (hindari konflik win32 device_info_plus<->network_info_plus).
+  battery_plus: ^6.0.3
+  package_info_plus: ^10.2.0
+  qr_flutter: ^4.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+  build_runner: ^2.4.9
+  riverpod_generator: ^2.4.0
+  sqflite_common_ffi: ^2.3.3
+
+flutter:
+  uses-material-design: true
