@@ -1,6 +1,6 @@
-// Verifikasi migrasi DB v10 → v12 terhadap SQLITE ASLI berisi data.
+// Verifikasi migrasi DB v10 → v13 terhadap SQLITE ASLI berisi data.
 //
-// Dua migrasi terakhir menyentuh tabel yang sudah dipakai di lapangan:
+// Migrasi-migrasi ini menyentuh tabel yang sudah dipakai di lapangan:
 //
 //   v11 — MEMBUANG lalu membuat ulang product_addons (id INTEGER → ULID).
 //         Aman HANYA bila tabel itu memang selalu kosong. Kalau ternyata
@@ -8,6 +8,9 @@
 //   v12 — menambah kolom sync_id pada additional_charges dan mengisinya untuk
 //         baris lama. Kolom `id` TIDAK boleh ikut berubah karena sudah
 //         dirujuk order_additional_charges.charge_id di baris pesanan lama.
+//   v13 — menambah orders.reservation_id dan MEMBUAT ULANG payments agar
+//         metode 'reservasi_dp' diterima CHECK. Baris pembayaran lama wajib
+//         selamat utuh — itu jejak uang shift-shift sebelumnya.
 //
 // Migrasinya dijalankan oleh AppDatabase yang SEBENARNYA — bukan salinan SQL
 // di berkas ini — supaya yang teruji adalah kode yang dipakai aplikasi.
@@ -42,9 +45,51 @@ void main() {
     if (await dbFile.exists()) await dbFile.delete();
   });
 
-  test('versi skema naik ke 12', () async {
+  test('versi skema naik ke 13', () async {
     final versi = (await db.rawQuery('PRAGMA user_version')).first.values.first;
-    expect(versi, 12);
+    expect(versi, 13);
+  });
+
+  group('reservasi (migrasi v13)', () {
+    test('orders punya kolom reservation_id', () async {
+      final info = await db.rawQuery('PRAGMA table_info(orders)');
+      expect(info.map((c) => c['name']), contains('reservation_id'));
+    });
+
+    test('pembayaran lama selamat utuh setelah payments dibuat ulang', () async {
+      final rows = await db.query('payments', orderBy: 'created_at');
+      expect(rows.length, 2);
+      expect(rows.first['payment_method'], 'cash');
+      expect(rows.first['amount'], 20000.0);
+      expect(rows.last['payment_method'], 'qris');
+      expect(rows.last['payment_note'], 'Pesan online — dibayar QRIS');
+    });
+
+    test("metode 'reservasi_dp' diterima, metode asing tetap ditolak", () async {
+      await db.insert('payments', {
+        'id': '01JQTESTPAYMENT0000000RES1',
+        'order_id': 'ORDERLAMA',
+        'amount': 50000.0,
+        'payment_method': 'reservasi_dp',
+        'created_by': 'kasir',
+      });
+      await expectLater(
+        db.insert('payments', {
+          'id': '01JQTESTPAYMENT0000000BAD1',
+          'order_id': 'ORDERLAMA',
+          'amount': 1000.0,
+          'payment_method': 'bitcoin',
+          'created_by': 'kasir',
+        }),
+        throwsA(anything),
+      );
+    });
+
+    test('indeks payments(order_id) dibuat ulang', () async {
+      final idx = await db.rawQuery(
+          "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_payments_order_id'");
+      expect(idx, isNotEmpty);
+    });
   });
 
   group('additional_charges (migrasi v12)', () {
@@ -199,6 +244,58 @@ Future<void> _bangunDatabaseV10(String path) async {
       updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   ''');
+
+  // Bentuk LAMA orders & payments (v10): tanpa reservation_id, CHECK metode
+  // tanpa 'reservasi_dp'. Kedua tabel ini disentuh migrasi v13.
+  await old.execute('''
+    CREATE TABLE orders (
+      id TEXT PRIMARY KEY,
+      table_number TEXT NOT NULL,
+      total_amount REAL NOT NULL,
+      paid_amount REAL NOT NULL DEFAULT 0,
+      payment_status TEXT NOT NULL DEFAULT 'unpaid',
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  ''');
+  await old.execute('''
+    CREATE TABLE payments (
+      id TEXT PRIMARY KEY CHECK (length(id) = 26),
+      order_id TEXT NOT NULL,
+      amount REAL NOT NULL CHECK (amount > 0),
+      payment_method TEXT NOT NULL CHECK (payment_method IN ('cash', 'card', 'qris', 'transfer')),
+      payment_note TEXT,
+      created_by TEXT NOT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+    )
+  ''');
+  await old.execute(
+      'CREATE INDEX IF NOT EXISTS idx_payments_order_id ON payments(order_id)');
+  await old.insert('orders', {
+    'id': 'ORDERLAMA',
+    'table_number': 'A1',
+    'total_amount': 45000.0,
+    'paid_amount': 45000.0,
+    'payment_status': 'paid',
+  });
+  await old.insert('payments', {
+    'id': '01JQTESTPAYMENT0000000CASH',
+    'order_id': 'ORDERLAMA',
+    'amount': 20000.0,
+    'payment_method': 'cash',
+    'created_by': 'kasir',
+    'created_at': '2026-08-01T10:00:00.000',
+  });
+  await old.insert('payments', {
+    'id': '01JQTESTPAYMENT0000000QRIS',
+    'order_id': 'ORDERLAMA',
+    'amount': 25000.0,
+    'payment_method': 'qris',
+    'payment_note': 'Pesan online — dibayar QRIS',
+    'created_by': 'kasir',
+    'created_at': '2026-08-01T10:05:00.000',
+  });
 
   await old.insert('products',
       {'id': 'PRD1', 'name': 'Nasi Goreng', 'price': 25000});

@@ -213,6 +213,9 @@ class Order {
   final String? complimentReason;
   final DateTime? complimentedAt;
   final String? discountNote;
+  // Terisi bila order dibuka dari reservasi cloud; ikut dikirim pada
+  // transaksi pelunasan supaya cloud menutup reservasinya.
+  final String? reservationId;
   final DateTime createdAt;
   final DateTime updatedAt;
 
@@ -239,6 +242,7 @@ class Order {
     this.complimentReason,
     this.complimentedAt,
     this.discountNote,
+    this.reservationId,
     required this.createdAt,
     required this.updatedAt,
   });
@@ -271,6 +275,7 @@ class Order {
         'compliment_reason': complimentReason,
         'complimented_at': complimentedAt?.toIso8601String(),
         'discount_note': discountNote,
+        'reservation_id': reservationId,
         'created_at': createdAt.toIso8601String(),
         'updated_at': updatedAt.toIso8601String(),
       };
@@ -302,6 +307,7 @@ class Order {
             ? DateTime.parse(map['complimented_at'] as String)
             : null,
         discountNote: map['discount_note'] as String?,
+        reservationId: map['reservation_id'] as String?,
         createdAt: DateTime.parse(map['created_at'] as String),
         updatedAt: DateTime.parse(map['updated_at'] as String),
       );
@@ -853,7 +859,7 @@ class Payment {
   final String id;
   final String orderId;
   final double amount;
-  final String paymentMethod; // cash, card, qris, transfer
+  final String paymentMethod; // cash, card, qris, transfer, reservasi_dp
   final String? paymentNote;
   final String createdBy;
   final DateTime createdAt;

@@ -32,7 +32,7 @@ class AppDatabase {
 
     return openDatabase(
       path,
-      version: 12,
+      version: 13,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
       onConfigure: _onConfigure,
@@ -141,6 +141,37 @@ class AppDatabase {
           whereArgs: [r['id']],
         );
       }
+    }
+    if (oldVersion < 13) {
+      // Reservasi dari cloud: order yang dibuka dari reservasi menyimpan id-nya,
+      // supaya transaksi pelunasan membawa reservation_id ke cloud dan
+      // reservasinya tertutup otomatis di sana.
+      await db.execute('ALTER TABLE orders ADD COLUMN reservation_id TEXT');
+      // Uang muka reservasi dicatat sebagai baris pembayaran bermetode
+      // 'reservasi_dp' — uangnya sudah masuk rekening saat DP, bukan ke laci,
+      // jadi harus dibedakan dari tunai/QRIS. CHECK tak bisa di-ALTER →
+      // recreate tabel payments, data lama dipertahankan (pola migrasi v7).
+      await db.execute('''
+        CREATE TABLE payments_new (
+          id TEXT PRIMARY KEY CHECK (length(id) = 26),
+          order_id TEXT NOT NULL,
+          amount REAL NOT NULL CHECK (amount > 0),
+          payment_method TEXT NOT NULL CHECK (payment_method IN ('cash', 'card', 'qris', 'transfer', 'reservasi_dp')),
+          payment_note TEXT,
+          created_by TEXT NOT NULL,
+          created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+        )
+      ''');
+      await db.execute(
+        'INSERT INTO payments_new (id, order_id, amount, payment_method, payment_note, created_by, created_at) '
+        'SELECT id, order_id, amount, payment_method, payment_note, created_by, created_at FROM payments',
+      );
+      await db.execute('DROP TABLE payments');
+      await db.execute('ALTER TABLE payments_new RENAME TO payments');
+      await db.execute(
+        'CREATE INDEX IF NOT EXISTS idx_payments_order_id ON payments(order_id)',
+      );
     }
   }
 
@@ -339,6 +370,7 @@ class AppDatabase {
         compliment_reason TEXT,
         complimented_at DATETIME,
         discount_note TEXT,
+        reservation_id TEXT,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
       )
@@ -449,7 +481,7 @@ class AppDatabase {
         id TEXT PRIMARY KEY CHECK (length(id) = 26),
         order_id TEXT NOT NULL,
         amount REAL NOT NULL CHECK (amount > 0),
-        payment_method TEXT NOT NULL CHECK (payment_method IN ('cash', 'card', 'qris', 'transfer')),
+        payment_method TEXT NOT NULL CHECK (payment_method IN ('cash', 'card', 'qris', 'transfer', 'reservasi_dp')),
         payment_note TEXT,
         created_by TEXT NOT NULL,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,

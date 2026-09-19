@@ -6,6 +6,7 @@ import '../../controllers/cashier_controller.dart';
 import '../../models/models.dart';
 import '../../services/cloud_sync_service.dart';
 import '../../services/qris_service.dart';
+import '../../services/reservation_service.dart';
 import '../../theme/theme.dart';
 import '../../utils/currency.dart';
 import '../../widgets/addon_picker_dialog.dart';
@@ -13,6 +14,7 @@ import '../../widgets/menu_avatar.dart';
 import '../../widgets/pax_input_dialog.dart';
 import '../../widgets/pin_auth_dialog.dart';
 import '../../widgets/qris_payment_dialog.dart';
+import '../../widgets/reservation_picker_dialog.dart';
 import '../../widgets/ui/ui.dart';
 
 class CashierScreen extends StatefulWidget {
@@ -919,6 +921,57 @@ class _CashierScreenState extends State<CashierScreen> {
     }
   }
 
+  /// Buka reservasi cloud menjadi order: pilih reservasi → pilih meja kosong →
+  /// order dibuat, DP tervalidasi tercatat, lalu meja itu dimuat di layar.
+  Future<void> _showReservations() async {
+    final r = await showReservationPicker(context);
+    if (r == null || !mounted) return;
+
+    final available = _controller.state.tables
+        .where((t) => t.status == 'available')
+        .toList();
+    if (available.isEmpty) {
+      showAppSnack(context, 'Tidak ada meja kosong untuk reservasi ini',
+          isError: true);
+      return;
+    }
+    final table = await showDialog<RestaurantTable>(
+      context: context,
+      builder: (_) => _TablePickerDialog(tables: available),
+    );
+    if (table == null || !mounted) return;
+
+    final cashierName = _controller.state.activeShift?.openedBy ?? 'Kasir';
+    try {
+      final opened = await ReservationService.instance.openAsOrder(
+        reservation: r,
+        tableNumber: table.tableNumber,
+        cashierName: cashierName,
+      );
+      if (!mounted) return;
+      await _controller.loadData();
+      final refreshed = _controller.state.tables.firstWhere(
+        (t) => t.tableNumber == table.tableNumber,
+        orElse: () => table,
+      );
+      _controller.selectTable(refreshed);
+      await _controller.loadOrderForTable(table.tableNumber);
+      if (!mounted) return;
+      final dp = opened.order.paidAmount > 0
+          ? ', DP ${CurrencyHelper.format(opened.order.paidAmount)} tercatat'
+          : '';
+      final skipped = opened.skipped.isEmpty
+          ? ''
+          : '. Menu tak dikenal POS dilewati: ${opened.skipped.join(', ')}';
+      showAppSnack(context,
+          'Reservasi ${r.customerName} dibuka di Meja ${table.tableNumber}$dp$skipped',
+          isError: opened.skipped.isNotEmpty);
+    } catch (e) {
+      if (!mounted) return;
+      showAppSnack(context, 'Gagal membuka reservasi: $e', isError: true);
+    }
+  }
+
   // ── Shift Gate ───────────────────────────────────────────────────────────
 
   Widget _buildShiftGate(CashierState state) {
@@ -1694,6 +1747,12 @@ class _CashierScreenState extends State<CashierScreen> {
                                     ? 'Meja ${state.selectedTable!.tableNumber}'
                                     : 'Pilih Meja',
                             onTap: _showTableSelector,
+                          ),
+                          _groupDivider(),
+                          _headerBtn(
+                            icon: Icons.event_seat_outlined,
+                            label: 'Reservasi',
+                            onTap: _showReservations,
                           ),
                         ]),
                         const SizedBox(width: 10),

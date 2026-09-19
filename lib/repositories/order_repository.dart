@@ -27,6 +27,7 @@ class OrderRepository {
     required List<OrderItemInput> items,
     String? waiterName,
     String? createdBy,
+    String? reservationId,
   }) async {
     final db = await _db.database;
     final now = DateTime.now();
@@ -74,6 +75,7 @@ class OrderRepository {
       orderStatus: 'cooking',
       createdBy: createdBy,
       paymentStatus: 'unpaid',
+      reservationId: reservationId,
       createdAt: now,
       updatedAt: now,
     );
@@ -242,6 +244,21 @@ class OrderRepository {
 
     // Sync status order (kini void) ke cloud
     await _enqueueOrder(orderId, 'upsert');
+  }
+
+  /// Order aktif (belum lunas, tidak void) yang dibuka dari sebuah reservasi —
+  /// dipakai agar reservasi yang sama tidak dibuka dua kali.
+  Future<Order?> getOpenOrderByReservation(String reservationId) async {
+    final db = await _db.database;
+    final rows = await db.query(
+      'orders',
+      where:
+          "reservation_id = ? AND payment_status != 'paid' AND voided_at IS NULL",
+      whereArgs: [reservationId],
+      orderBy: 'created_at DESC',
+      limit: 1,
+    );
+    return rows.isEmpty ? null : Order.fromMap(rows.first);
   }
 
   Future<Order?> getOrderByTable(String tableNumber) async {
@@ -797,7 +814,29 @@ class OrderRepository {
       );
     });
 
-    // Outbox: kirim transaksi ke cloud dengan breakdown penjualan/pajak/charge
+    // Outbox: kirim transaksi ke cloud dengan breakdown penjualan/pajak/charge.
+    //
+    // Bila order sudah punya pembayaran sebelumnya (uang muka reservasi,
+    // bayar sebagian), payments[] HARUS memuat semuanya — bukan hanya
+    // pelunasan barusan. Tanpa ini cloud melihat transaksi 200.000 yang
+    // "dibayar" 100.000 tunai, dan baris reservasi_dp yang menjadi dasar
+    // pengecualian kas hari kunjungan hilang.
+    final payRows = await db.query(
+      'payments',
+      where: 'order_id = ?',
+      whereArgs: [orderId],
+      orderBy: 'created_at ASC',
+    );
+    final paymentsList = payRows.length > 1
+        ? payRows
+            .map((r) => {
+                  'payment_method': r['payment_method'],
+                  'amount': (r['amount'] as num).toDouble(),
+                  'payment_note': r['payment_note'],
+                  'created_at': _isoUtcStr(r['created_at'] as String),
+                })
+            .toList()
+        : null;
     await _enqueueTransaction(
       transaction: transaction,
       order: order,
@@ -806,6 +845,7 @@ class OrderRepository {
       paidAmount: paidAmount,
       changeAmount: change,
       cashierId: createdBy ?? '',
+      payments: paymentsList,
     );
 
     // Sync status order terbaru (kini 'paid') ke cloud
@@ -899,6 +939,10 @@ class OrderRepository {
           'cashier_name': cashierId, // kasir pemroses bayar
           'created_by': cashierId,
           'orderer_name': _orderersLabel(items, order), // label pemesan = struk
+          // Order dari reservasi: cloud menutup reservasinya begitu transaksi
+          // ini tersinkron. Uang mukanya ada di payments[] bermetode reservasi_dp.
+          if (order.reservationId != null && order.reservationId!.isNotEmpty)
+            'reservation_id': order.reservationId,
           'items': items
               .map((i) => {
                     'product_name': i.productName,

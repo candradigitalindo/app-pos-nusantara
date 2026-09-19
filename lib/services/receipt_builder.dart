@@ -246,10 +246,12 @@ class ReceiptBuilder {
     buf.addAll(_Esc.boldOn());
     buf.addAll(_Esc.line('PENJUALAN PER METODE'));
     buf.addAll(_Esc.boldOff());
-    for (final m in const ['cash', 'qris', 'card', 'transfer']) {
+    for (final m in const ['cash', 'qris', 'card', 'transfer', 'reservasi_dp']) {
       final v = (byMethod[m] as Map?) ?? const {};
       final cnt = (v['count'] as num?)?.toInt() ?? 0;
       final total = (v['total'] as num?)?.toDouble() ?? 0;
+      // DP reservasi bukan uang laci; tampil hanya bila memang ada.
+      if (m == 'reservasi_dp' && cnt == 0) continue;
       buf.addAll(_Esc.line(_rightAlign(
           '${_paymentMethodLabel(m)} ($cnt)', _formatAmount(total))));
     }
@@ -423,10 +425,12 @@ class ReceiptBuilder {
     buf.addAll(_Esc.boldOn());
     buf.addAll(_Esc.line('PEMBAYARAN DIPROSES'));
     buf.addAll(_Esc.boldOff());
-    for (final m in const ['cash', 'qris', 'card', 'transfer']) {
+    for (final m in const ['cash', 'qris', 'card', 'transfer', 'reservasi_dp']) {
       final v = (byMethod[m] as Map?) ?? const {};
       final cnt = (v['count'] as num?)?.toInt() ?? 0;
       final total = (v['total'] as num?)?.toDouble() ?? 0;
+      // DP reservasi bukan uang laci; tampil hanya bila memang ada.
+      if (m == 'reservasi_dp' && cnt == 0) continue;
       buf.addAll(_Esc.line(_rightAlign(
           '${_paymentMethodLabel(m)} ($cnt)', _formatAmount(total))));
     }
@@ -821,6 +825,8 @@ class ReceiptBuilder {
         return 'QRIS';
       case 'transfer':
         return 'Transfer';
+      case 'reservasi_dp':
+        return 'DP Reservasi';
       case 'compliment':
         return 'Compliment';
       default:
