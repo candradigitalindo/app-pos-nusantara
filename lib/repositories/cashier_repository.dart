@@ -7,8 +7,11 @@ import 'order_repository.dart';
 import 'sync_queue_repository.dart';
 
 class CashierRepository {
+  CashierRepository({DateTime Function()? now}) : _now = now ?? DateTime.now;
+
   final AppDatabase _db = AppDatabase.instance;
   final SyncQueueRepository _sync = SyncQueueRepository();
+  final DateTime Function() _now;
 
   /// Timestamp payload cloud: SELALU UTC + 'Z' (zona eksplisit). DB lokal tetap
   /// waktu lokal.
@@ -39,7 +42,7 @@ class CashierRepository {
         throw Exception('Shift sudah dibuka oleh ${activeShift.openedBy}');
       }
 
-      final now = DateTime.now();
+      final now = _now();
       final shift = CashierShift(
         id: Ulid.generate(),
         openedBy: openedBy,
@@ -137,12 +140,10 @@ class CashierRepository {
   }) async {
     final db = await _db.database;
     return db.transaction((txn) async {
-      final now = DateTime.now();
+      final now = _now();
 
       // Calculate totals from payments during this shift
-      final shift = await _getShiftById(shiftId, executor: txn);
-      if (shift == null) throw Exception('Shift tidak ditemukan');
-      if (!shift.isOpen) throw Exception('Shift sudah ditutup');
+      final shift = await _requireOpenShift(shiftId, executor: txn);
 
       // Syarat tutup kasir: semua tagihan harus selesai dibayar dulu. Dicek di
       // sini (bukan hanya di layar) supaya berlaku untuk SEMUA jalur — kasir
@@ -153,7 +154,8 @@ class CashierRepository {
             'Selesaikan dulu sebelum tutup kasir.');
       }
 
-      final totals = await _calculateShiftTotals(shiftId, executor: txn);
+      final totals =
+          await _calculateShiftTotals(shiftId, executor: txn, cutoff: now);
 
       // Kas laci = hitung fisik (closingCash) bila diberikan; selain itu pakai
       // ekspektasi teoritis modal awal + tunai + kas masuk − kas keluar.
@@ -199,13 +201,12 @@ class CashierRepository {
   }) async {
     final db = await _db.database;
     return db.transaction((txn) async {
-      final now = DateTime.now();
+      final now = _now();
 
-      final current = await _getShiftById(currentShiftId, executor: txn);
-      if (current == null) throw Exception('Shift tidak ditemukan');
-      if (!current.isOpen) throw Exception('Shift sudah ditutup');
+      final current = await _requireOpenShift(currentShiftId, executor: txn);
 
-      final totals = await _calculateShiftTotals(currentShiftId, executor: txn);
+      final totals = await _calculateShiftTotals(currentShiftId,
+          executor: txn, cutoff: now);
       // Saldo kas fisik yang diserahterimakan ke kasir berikutnya
       // (hitung fisik bila ada; selain itu modal + tunai + kas masuk − keluar).
       final carryOverCash = countedCash ??
@@ -262,23 +263,22 @@ class CashierRepository {
     required String counterpartName,
     String note = '',
   }) async {
-    final now = DateTime.now();
-    final movement = CashMovement(
-      id: Ulid.generate(),
-      shiftId: shiftId,
-      movementType: movementType,
-      amount: amount,
-      counterpartName: counterpartName,
-      note: note,
-      createdAt: now,
-    );
-
     final db = await _db.database;
-    await db.transaction((txn) async {
+    return db.transaction((txn) async {
+      await _requireOpenShift(shiftId, executor: txn);
+      final movement = CashMovement(
+        id: Ulid.generate(),
+        shiftId: shiftId,
+        movementType: movementType,
+        amount: amount,
+        counterpartName: counterpartName,
+        note: note,
+        createdAt: _now(),
+      );
       await txn.insert('cashier_cash_movements', movement.toMap());
       await _enqueueCashMovement(movement, executor: txn);
+      return movement;
     });
-    return movement;
   }
 
   Future<void> _enqueueCashMovement(CashMovement movement,
@@ -345,8 +345,44 @@ class CashierRepository {
     return CashierShift.fromMap(results.first);
   }
 
+  Future<CashierShift> _requireOpenShift(String id,
+      {required DatabaseExecutor executor}) async {
+    final shift = await _getShiftById(id, executor: executor);
+    if (shift == null) throw Exception('Shift tidak ditemukan');
+    if (!shift.isOpen) throw Exception('Shift sudah ditutup');
+    if ((await getActiveShift(executor: executor))?.id != id) {
+      throw Exception(
+          'Shift kasir telah berubah. Muat ulang sebelum melanjutkan.');
+    }
+    return shift;
+  }
+
   Future<Map<String, double>> getShiftTotals(String shiftId) =>
       _calculateShiftTotals(shiftId);
+
+  static String _dateKey(DateTime value) {
+    final local = value.toLocal();
+    return '${local.year.toString().padLeft(4, '0')}-'
+        '${local.month.toString().padLeft(2, '0')}-'
+        '${local.day.toString().padLeft(2, '0')}';
+  }
+
+  static Map<String, Map<String, num>> _emptyMethods() => {
+        for (final method in ['cash', 'card', 'qris', 'transfer'])
+          method: {'count': 0, 'total': 0},
+      };
+
+  static Map<String, dynamic> _emptyDay(String date) => {
+        'date': date,
+        'sales_count': 0,
+        'sales_total': 0.0,
+        'by_method': _emptyMethods(),
+        'cash_in_count': 0,
+        'cash_in_total': 0.0,
+        'cash_out_count': 0,
+        'cash_out_total': 0.0,
+        'outside_shift': false,
+      };
 
   /// Laporan shift lengkap untuk struk & sync cloud:
   /// per metode bayar (jumlah transaksi + total), kas masuk/keluar, ekspektasi kas.
@@ -354,40 +390,59 @@ class CashierRepository {
       {DatabaseExecutor? executor}) async {
     final db = executor ?? await _db.database;
     final shift = await _getShiftById(shiftId, executor: db);
-    if (shift == null) return {};
+    if (shift == null) throw Exception('Shift tidak ditemukan');
 
     // Jendela shift [opened_at, closed_at). Tanpa batas atas, cetak ulang
     // laporan shift LAMA ikut menghitung pembayaran shift berikutnya.
     // .toLocal() menormalkan shift hasil restore cloud (tersimpan UTC+Z).
-    final since = shift.openedAt.toLocal().toIso8601String();
-    final until =
-        (shift.closedAt ?? DateTime.now()).toLocal().toIso8601String();
+    final periodStart = shift.openedAt.toLocal();
+    final periodEnd = (shift.closedAt ?? _now()).toLocal();
+    final since = periodStart.toIso8601String();
+    final until = periodEnd.toIso8601String();
+
+    // A shift can stay open overnight. Keep its complete ledger and show a
+    // separate calendar-day breakdown instead of silently dropping earlier
+    // sales. At midnight, the exclusive end belongs to the preceding day.
+    // Restored/forgotten shifts can be very old. Include the endpoints and
+    // every date with activity, without allocating years of empty rows.
+    final lastDay = periodEnd.isAfter(periodStart)
+        ? periodEnd.subtract(const Duration(microseconds: 1))
+        : periodStart;
+    final daily = <String, Map<String, dynamic>>{
+      _dateKey(periodStart): _emptyDay(_dateKey(periodStart)),
+      _dateKey(lastDay): _emptyDay(_dateKey(lastDay)),
+    };
+    Map<String, dynamic> dayFor(String date) =>
+        daily.putIfAbsent(date, () => _emptyDay(date));
+    final crossesDay = _dateKey(periodStart) != _dateKey(lastDay);
 
     // Breakdown per metode: count + total
     final payRows = await db.rawQuery(
       '''
-      SELECT p.payment_method, COUNT(*) AS cnt, SUM(p.amount) AS total
+      SELECT substr(p.created_at, 1, 10) AS day, p.payment_method,
+             COUNT(*) AS cnt, SUM(p.amount) AS total
       FROM payments p
       JOIN orders o ON o.id = p.order_id
       WHERE p.created_at >= ? AND p.created_at < ? AND o.voided_at IS NULL
-      GROUP BY p.payment_method
+      GROUP BY substr(p.created_at, 1, 10), p.payment_method
     ''',
       [since, until],
     );
 
-    final methods = <String, Map<String, num>>{
-      'cash': {'count': 0, 'total': 0},
-      'card': {'count': 0, 'total': 0},
-      'qris': {'count': 0, 'total': 0},
-      'transfer': {'count': 0, 'total': 0},
-    };
+    final methods = _emptyMethods();
     var salesTotal = 0.0;
     for (final r in payRows) {
       final m = r['payment_method'] as String;
       final cnt = (r['cnt'] as num).toInt();
       final total = (r['total'] as num).toDouble();
-      methods[m] = {'count': cnt, 'total': total};
+      final aggregate = methods.putIfAbsent(m, () => {'count': 0, 'total': 0});
+      aggregate['count'] = aggregate['count']! + cnt;
+      aggregate['total'] = aggregate['total']! + total;
       salesTotal += total;
+      final day = dayFor(r['day'] as String);
+      final dayMethods = day['by_method'] as Map<String, Map<String, num>>;
+      dayMethods[m] = {'count': cnt, 'total': total};
+      day['sales_total'] = (day['sales_total'] as num) + total;
     }
 
     // Jumlah TRANSAKSI = jumlah order yang selesai dalam jendela shift, dari
@@ -398,37 +453,54 @@ class CashierRepository {
     // semacam itu tak pernah punya baris payments sama sekali).
     final salesCountRows = await db.rawQuery(
       '''
-      SELECT COUNT(*) AS cnt
+      SELECT substr(t.transaction_date, 1, 10) AS day, COUNT(*) AS cnt
       FROM transactions t
       JOIN orders o ON o.id = t.order_id
       WHERE t.transaction_date >= ? AND t.transaction_date < ? AND o.voided_at IS NULL
+      GROUP BY substr(t.transaction_date, 1, 10)
     ''',
       [since, until],
     );
-    final salesCount = (salesCountRows.first['cnt'] as num?)?.toInt() ?? 0;
+    var salesCount = 0;
+    for (final row in salesCountRows) {
+      final count = (row['cnt'] as num).toInt();
+      salesCount += count;
+      dayFor(row['day'] as String)['sales_count'] = count;
+    }
 
     // Kas masuk / keluar selama shift
     final moveRows = await db.rawQuery(
       '''
-      SELECT movement_type, COUNT(*) AS cnt, SUM(amount) AS total
+      SELECT movement_type, amount, created_at
       FROM cashier_cash_movements
       WHERE shift_id = ?
-      GROUP BY movement_type
     ''',
       [shiftId],
     );
     var cashInCount = 0, cashOutCount = 0;
     var cashInTotal = 0.0, cashOutTotal = 0.0;
+    var outOfPeriodMovementCount = 0;
     for (final r in moveRows) {
       final t = r['movement_type'] as String;
-      final cnt = (r['cnt'] as num).toInt();
-      final total = (r['total'] as num).toDouble();
+      final total = (r['amount'] as num).toDouble();
+      final at = DateTime.parse(r['created_at'] as String).toLocal();
+      final day = dayFor(_dateKey(at));
+      // Older versions allowed stale clients to add a movement after close.
+      // Preserve those assigned amounts and make their time anomaly visible.
+      if (at.isBefore(periodStart) || !at.isBefore(periodEnd)) {
+        day['outside_shift'] = true;
+        outOfPeriodMovementCount++;
+      }
       if (t == 'in') {
-        cashInCount = cnt;
-        cashInTotal = total;
+        cashInCount++;
+        cashInTotal += total;
+        day['cash_in_count'] = (day['cash_in_count'] as int) + 1;
+        day['cash_in_total'] = (day['cash_in_total'] as num) + total;
       } else if (t == 'out') {
-        cashOutCount = cnt;
-        cashOutTotal = total;
+        cashOutCount++;
+        cashOutTotal += total;
+        day['cash_out_count'] = (day['cash_out_count'] as int) + 1;
+        day['cash_out_total'] = (day['cash_out_total'] as num) + total;
       }
     }
 
@@ -522,6 +594,11 @@ class CashierRepository {
 
     return {
       'shift_id': shiftId,
+      'period_start': since,
+      'period_end': until,
+      'crosses_day': crossesDay,
+      'by_day': [for (final date in daily.keys.toList()..sort()) daily[date]!],
+      'out_of_period_movement_count': outOfPeriodMovementCount,
       'opening_cash': shift.openingCash,
       'sales_count': salesCount,
       'sales_total': salesTotal,
@@ -655,11 +732,11 @@ class CashierRepository {
   }
 
   Future<Map<String, double>> _calculateShiftTotals(String shiftId,
-      {DatabaseExecutor? executor}) async {
+      {DatabaseExecutor? executor, DateTime? cutoff}) async {
     final db = executor ?? await _db.database;
     // Get shift to know when it was opened
     final shift = await _getShiftById(shiftId, executor: db);
-    if (shift == null) return {};
+    if (shift == null) throw Exception('Shift tidak ditemukan');
     // Jendela [opened_at, closed_at) — tanpa batas atas, menghitung ulang
     // total shift LAMA akan menyerap pembayaran shift berikutnya.
     final results = await db.rawQuery(
@@ -672,7 +749,7 @@ class CashierRepository {
     ''',
       [
         shift.openedAt.toLocal().toIso8601String(),
-        (shift.closedAt ?? DateTime.now()).toLocal().toIso8601String(),
+        (shift.closedAt ?? cutoff ?? _now()).toLocal().toIso8601String(),
       ],
     );
 

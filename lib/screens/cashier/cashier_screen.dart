@@ -21,6 +21,7 @@ import '../../widgets/reservation_picker_dialog.dart';
 import '../../widgets/ui/ui.dart';
 import 'cashier_order_actions.dart';
 import 'cashier_widgets.dart';
+import 'shift_period_summary.dart';
 
 class CashierScreen extends StatefulWidget {
   final String? initialTableNumber;
@@ -634,14 +635,11 @@ class _CashierScreenState extends State<CashierScreen>
     showDialog(
       context: context,
       barrierDismissible: false,
-      builder: (ctx) => _CloseShiftDialog(
+      builder: (ctx) => CloseShiftDialog(
         activeShift: shift,
-        getShiftTotals: _controller.getShiftTotals,
-        getShiftReport: _controller.getShiftReport,
-        getShiftMovements: _controller.getShiftMovements,
-        onClose: () async {
-          await _controller.closeShift();
-        },
+        getShiftReport: () => _controller.getShiftReport(shiftId: shift.id),
+        getShiftMovements: () => _controller.getShiftMovements(shiftId: shift.id),
+        onClose: () => _controller.closeShift(shiftId: shift.id),
       ),
     );
   }
@@ -878,16 +876,14 @@ class _CashierScreenState extends State<CashierScreen>
       barrierDismissible: false,
       builder: (ctx) => _SwapShiftDialog(
         activeShift: shift,
-        getShiftTotals: _controller.getShiftTotals,
-        getShiftReport: _controller.getShiftReport,
+        getShiftReport: () => _controller.getShiftReport(shiftId: shift.id),
         getCashierUsers: _controller.getCashierUsers,
-        getShiftMovements: _controller.getShiftMovements,
-        onSwap: (handoverTo, newCash) async {
-          await _controller.swapShift(
+        getShiftMovements: () => _controller.getShiftMovements(shiftId: shift.id),
+        onSwap: (handoverTo, newCash) => _controller.swapShift(
+            shiftId: shift.id,
             handoverTo: handoverTo,
             newOpeningCash: newCash,
-          );
-        },
+          ),
       ),
     );
   }
@@ -2906,52 +2902,74 @@ class _CashMovementDialogState extends State<_CashMovementDialog> {
   }
 }
 
+// All monetary summary fields come from the same report cutoff.
+Map<String, double> _reportMethodTotals(Map<String, dynamic> report) {
+  final methods = report['by_method'] as Map? ?? const {};
+  return {
+    for (final method in ['cash', 'card', 'qris', 'transfer'])
+      method: ((methods[method] as Map?)?['total'] as num?)?.toDouble() ?? 0,
+  };
+}
+
 // ── Close Shift Dialog ────────────────────────────────────────────────────────
 
-class _CloseShiftDialog extends StatefulWidget {
+class CloseShiftDialog extends StatefulWidget {
   final CashierShift activeShift;
-  final Future<Map<String, double>> Function() getShiftTotals;
   final Future<Map<String, dynamic>> Function() getShiftReport;
   final Future<List<CashMovement>> Function() getShiftMovements;
-  final Future<void> Function() onClose;
+  final Future<String?> Function() onClose;
 
-  const _CloseShiftDialog({
+  const CloseShiftDialog({
+    super.key,
     required this.activeShift,
-    required this.getShiftTotals,
     required this.getShiftReport,
     required this.getShiftMovements,
     required this.onClose,
   });
 
   @override
-  State<_CloseShiftDialog> createState() => _CloseShiftDialogState();
+  State<CloseShiftDialog> createState() => _CloseShiftDialogState();
 }
 
-class _CloseShiftDialogState extends State<_CloseShiftDialog> {
+class _CloseShiftDialogState extends State<CloseShiftDialog> {
   Map<String, double>? _totals;
   Map<String, dynamic>? _report;
   List<CashMovement> _movements = [];
   bool _loading = true;
   bool _closing = false;
+  String? _loadError;
+  String? _closeError;
 
   @override
   void initState() {
     super.initState();
+    _load();
+  }
+
+  void _load() {
+    setState(() { _loading = true; _loadError = null; });
     Future.wait([
-      widget.getShiftTotals(),
       widget.getShiftMovements(),
       widget.getShiftReport(),
     ]).then((r) {
+      if ((r[1] as Map<String, dynamic>).isEmpty) {
+        throw Exception('Laporan shift tidak tersedia. Muat ulang.');
+      }
       if (mounted) {
         setState(() {
-          _totals = r[0] as Map<String, double>;
-          _movements = r[1] as List<CashMovement>;
-          _report = r[2] as Map<String, dynamic>;
+          _movements = r[0] as List<CashMovement>;
+          _report = r[1] as Map<String, dynamic>;
+          _totals = _reportMethodTotals(_report!);
           _loading = false;
         });
       }
-    }).catchError((_) {
-      if (mounted) setState(() => _loading = false);
+    }).catchError((Object error) {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _loadError = 'Gagal memuat ringkasan: ${error.toString().replaceFirst('Exception: ', '')}';
+        });
+      }
     });
   }
 
@@ -2959,10 +2977,7 @@ class _CloseShiftDialogState extends State<_CloseShiftDialog> {
     final d = DateTime.now().difference(widget.activeShift.openedAt);
     final h = d.inHours;
     final m = d.inMinutes % 60;
-    final base = h > 0 ? '${h}j ${m}m' : '${m}m';
-    // Peringatan: shift wajar ditutup harian. >24 jam = kemungkinan lupa tutup
-    // (akumulasi bikin total/durasi tampak tak masuk akal, mis. 200 jam).
-    return h >= 24 ? '$base ⚠ segera tutup' : base;
+    return h > 0 ? '${h}j ${m}m' : '${m}m';
   }
 
   String _timeStr(DateTime dt) =>
@@ -2975,7 +2990,7 @@ class _CloseShiftDialogState extends State<_CloseShiftDialog> {
     final cardIn = totals?['card'] ?? 0;
     final qrisIn = totals?['qris'] ?? 0;
     final transferIn = totals?['transfer'] ?? 0;
-    final totalPendapatan = cashIn + cardIn + qrisIn + transferIn;
+    final totalPendapatan = (_report?['sales_total'] as num?)?.toDouble() ?? 0;
     // Kas di Laci = ekspektasi kas fisik (modal + tunai + kas masuk − kas
     // keluar), SAMA dengan "KAS SEHARUSNYA" di struk & payload cloud
     // (CashierRepository.getShiftReport → expected_cash). Formula lama
@@ -2989,7 +3004,9 @@ class _CloseShiftDialogState extends State<_CloseShiftDialog> {
     final totalMovIn = cashIns.fold(0.0, (s, m) => s + m.amount);
     final totalMovOut = cashOuts.fold(0.0, (s, m) => s + m.amount);
 
-    return Dialog(
+    return PopScope(
+      canPop: !_closing,
+      child: Dialog(
       insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 32),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
       child: SingleChildScrollView(
@@ -3018,7 +3035,7 @@ class _CloseShiftDialogState extends State<_CloseShiftDialog> {
                             fontSize: 18, fontWeight: FontWeight.bold)),
                   ),
                   IconButton(
-                    onPressed: () => Navigator.pop(context),
+                    onPressed: _closing ? null : () => Navigator.pop(context),
                     icon: const Icon(Icons.close, color: AppColors.textTertiary),
                     padding: EdgeInsets.zero,
                   ),
@@ -3066,10 +3083,12 @@ class _CloseShiftDialogState extends State<_CloseShiftDialog> {
                     ),
                     const SizedBox(height: 6),
                     Text(
-                      'Kasir: ${widget.activeShift.openedBy}  •  Buka: ${_timeStr(widget.activeShift.openedAt)}',
+                      'Kasir: ${widget.activeShift.openedBy}',
                       style: const TextStyle(
                           fontSize: 12, color: AppColors.textSecondary),
                     ),
+                    const SizedBox(height: 6),
+                    ShiftPeriodSummary(shift: widget.activeShift, report: _report ?? const {}),
                     const SizedBox(height: 12),
                     if (_loading)
                       const Center(
@@ -3082,7 +3101,7 @@ class _CloseShiftDialogState extends State<_CloseShiftDialog> {
                           ),
                         ),
                       )
-                    else ...[
+                    else if (_loadError == null) ...[
                       _row('Kas Awal',
                           CurrencyHelper.format(widget.activeShift.openingCash),
                           isSubtle: true),
@@ -3108,7 +3127,7 @@ class _CloseShiftDialogState extends State<_CloseShiftDialog> {
                           child: Divider(height: 1, color: AppColors.border)),
                       Row(
                         children: [
-                          const Text('Total Pendapatan',
+                          const Text('Total Penjualan Shift',
                               style: TextStyle(
                                   fontSize: 13, fontWeight: FontWeight.w700)),
                           const Spacer(),
@@ -3284,12 +3303,20 @@ class _CloseShiftDialogState extends State<_CloseShiftDialog> {
 
               const SizedBox(height: 20),
 
+              if (_loadError != null) ...[
+                Text(_loadError!, key: const Key('shift-load-error'), style: const TextStyle(color: AppColors.danger)),
+                TextButton(onPressed: _loading || _closing ? null : _load, child: const Text('Muat Ulang Ringkasan')),
+              ],
+              if (_closeError != null) ...[
+                Text(_closeError!, key: const Key('shift-close-error'), style: const TextStyle(color: AppColors.danger)),
+                const SizedBox(height: 12),
+              ],
               // Actions
               Row(
                 children: [
                   Expanded(
                     child: AppButton.neutral('Batal',
-                        onPressed: () => Navigator.pop(context)),
+                        onPressed: _closing ? null : () => Navigator.pop(context)),
                   ),
                   const SizedBox(width: AppSpacing.sm),
                   Expanded(
@@ -3299,12 +3326,19 @@ class _CloseShiftDialogState extends State<_CloseShiftDialog> {
                       icon: Icons.logout_rounded,
                       accent: AppColors.warning,
                       loading: _closing,
-                      onPressed: _closing
+                      onPressed: _closing || _loading || _loadError != null
                           ? null
                           : () async {
-                              setState(() => _closing = true);
-                              Navigator.pop(context);
-                              await widget.onClose();
+                              setState(() { _closing = true; _closeError = null; });
+                              String? error;
+                              try { error = await widget.onClose(); }
+                              catch (e) { error = 'Gagal menutup shift: ${e.toString().replaceFirst('Exception: ', '')}'; }
+                              if (!mounted) return;
+                              if (error == null) {
+                                Navigator.of(this.context).pop();
+                              } else {
+                                setState(() { _closing = false; _closeError = error; });
+                              }
                             },
                     ),
                   ),
@@ -3313,6 +3347,7 @@ class _CloseShiftDialogState extends State<_CloseShiftDialog> {
             ],
           ),
         ),
+      ),
       ),
     );
   }
@@ -3395,15 +3430,13 @@ class _CloseShiftDialogState extends State<_CloseShiftDialog> {
 
 class _SwapShiftDialog extends StatefulWidget {
   final CashierShift activeShift;
-  final Future<Map<String, double>> Function() getShiftTotals;
   final Future<Map<String, dynamic>> Function() getShiftReport;
   final Future<List<User>> Function() getCashierUsers;
   final Future<List<CashMovement>> Function() getShiftMovements;
-  final Future<void> Function(String handoverTo, double newOpeningCash) onSwap;
+  final Future<String?> Function(String handoverTo, double newOpeningCash) onSwap;
 
   const _SwapShiftDialog({
     required this.activeShift,
-    required this.getShiftTotals,
     required this.getShiftReport,
     required this.getCashierUsers,
     required this.getShiftMovements,
@@ -3421,6 +3454,8 @@ class _SwapShiftDialogState extends State<_SwapShiftDialog> {
   List<CashMovement> _movements = [];
   bool _loading = true;
   bool _submitting = false;
+  String? _loadError;
+  String? _submitError;
   bool _cashEmpty = false;
   String _handoverName = '';
   final _cashCtrl = TextEditingController();
@@ -3428,18 +3463,25 @@ class _SwapShiftDialogState extends State<_SwapShiftDialog> {
   @override
   void initState() {
     super.initState();
+    _load();
+  }
+
+  void _load() {
+    setState(() { _loading = true; _loadError = null; });
     Future.wait([
-      widget.getShiftTotals(),
       widget.getCashierUsers(),
       widget.getShiftMovements(),
       widget.getShiftReport(),
     ]).then((results) {
+      if ((results[2] as Map<String, dynamic>).isEmpty) {
+        throw Exception('Laporan shift tidak tersedia. Muat ulang.');
+      }
       if (mounted) {
-        final report = results[3] as Map<String, dynamic>;
+        final report = results[2] as Map<String, dynamic>;
         setState(() {
-          _totals = results[0] as Map<String, double>;
-          _users = results[1] as List<User>;
-          _movements = results[2] as List<CashMovement>;
+          _totals = _reportMethodTotals(report);
+          _users = results[0] as List<User>;
+          _movements = results[1] as List<CashMovement>;
           _report = report;
           _loading = false;
         });
@@ -3454,8 +3496,13 @@ class _SwapShiftDialogState extends State<_SwapShiftDialog> {
         _cashCtrl.text =
             CurrencyHelper.formatInput(expected < 0 ? 0 : expected.round());
       }
-    }).catchError((_) {
-      if (mounted) setState(() => _loading = false);
+    }).catchError((Object error) {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _loadError = 'Gagal memuat ringkasan: ${error.toString().replaceFirst('Exception: ', '')}';
+        });
+      }
     });
   }
 
@@ -3473,12 +3520,6 @@ class _SwapShiftDialogState extends State<_SwapShiftDialog> {
     return '${m}m';
   }
 
-  String _timeStr(DateTime dt) {
-    final h = dt.hour.toString().padLeft(2, '0');
-    final m = dt.minute.toString().padLeft(2, '0');
-    return '$h:$m';
-  }
-
   @override
   Widget build(BuildContext context) {
     final totals = _totals;
@@ -3486,13 +3527,15 @@ class _SwapShiftDialogState extends State<_SwapShiftDialog> {
     final cardIn = totals?['card'] ?? 0;
     final qrisIn = totals?['qris'] ?? 0;
     final transferIn = totals?['transfer'] ?? 0;
-    final totalPendapatan = cashIn + cardIn + qrisIn + transferIn;
+    final totalPendapatan = (_report?['sales_total'] as num?)?.toDouble() ?? 0;
     // Sama dengan expected_cash di CashierRepository.getShiftReport (modal +
     // tunai + kas masuk − kas keluar) — konsisten dengan struk & payload cloud.
     final kasLaci = (_report?['expected_cash'] as num?)?.toDouble() ??
         (widget.activeShift.openingCash + cashIn);
 
-    return Dialog(
+    return PopScope(
+      canPop: !_submitting,
+      child: Dialog(
       insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 32),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
       child: SingleChildScrollView(
@@ -3521,7 +3564,7 @@ class _SwapShiftDialogState extends State<_SwapShiftDialog> {
                             fontSize: 18, fontWeight: FontWeight.bold)),
                   ),
                   IconButton(
-                    onPressed: () => Navigator.pop(context),
+                    onPressed: _submitting ? null : () => Navigator.pop(context),
                     icon: const Icon(Icons.close, color: AppColors.textTertiary),
                     padding: EdgeInsets.zero,
                   ),
@@ -3572,10 +3615,12 @@ class _SwapShiftDialogState extends State<_SwapShiftDialog> {
                     ),
                     const SizedBox(height: 6),
                     Text(
-                      'Kasir: ${widget.activeShift.openedBy}  •  Buka: ${_timeStr(widget.activeShift.openedAt)}',
+                      'Kasir: ${widget.activeShift.openedBy}',
                       style: const TextStyle(
                           fontSize: 12, color: AppColors.textSecondary),
                     ),
+                    const SizedBox(height: 6),
+                    ShiftPeriodSummary(shift: widget.activeShift, report: _report ?? const {}),
                     const SizedBox(height: 12),
 
                     if (_loading)
@@ -3591,7 +3636,7 @@ class _SwapShiftDialogState extends State<_SwapShiftDialog> {
                           ),
                         ),
                       )
-                    else ...[
+                    else if (_loadError == null) ...[
                       _summaryRow('Kas Awal',
                           CurrencyHelper.format(widget.activeShift.openingCash),
                           isSubtle: true),
@@ -3624,7 +3669,7 @@ class _SwapShiftDialogState extends State<_SwapShiftDialog> {
                       ),
                       Row(
                         children: [
-                          const Text('Total Pendapatan',
+                          const Text('Total Penjualan Shift',
                               style: TextStyle(
                                   fontSize: 13, fontWeight: FontWeight.w700)),
                           const Spacer(),
@@ -3887,12 +3932,20 @@ class _SwapShiftDialogState extends State<_SwapShiftDialog> {
               ),
               const SizedBox(height: 20),
 
+              if (_loadError != null) ...[
+                Text(_loadError!, style: const TextStyle(color: AppColors.danger)),
+                TextButton(onPressed: _loading || _submitting ? null : _load, child: const Text('Muat Ulang Ringkasan')),
+              ],
+              if (_submitError != null) ...[
+                Text(_submitError!, style: const TextStyle(color: AppColors.danger)),
+                const SizedBox(height: 12),
+              ],
               // ── Actions ──
               Row(
                 children: [
                   Expanded(
                     child: AppButton.neutral('Batal',
-                        onPressed: () => Navigator.pop(context)),
+                        onPressed: _submitting ? null : () => Navigator.pop(context)),
                   ),
                   const SizedBox(width: AppSpacing.sm),
                   Expanded(
@@ -3902,7 +3955,7 @@ class _SwapShiftDialogState extends State<_SwapShiftDialog> {
                       icon: Icons.swap_horiz_rounded,
                       accent: AppColors.moduleKasir,
                       loading: _submitting,
-                      onPressed: _submitting
+                      onPressed: _submitting || _loading || _loadError != null
                           ? null
                           : () async {
                               final name = _handoverName.trim();
@@ -3919,9 +3972,16 @@ class _SwapShiftDialogState extends State<_SwapShiftDialog> {
                                 return;
                               }
                               final cash = double.tryParse(raw) ?? 0;
-                              setState(() => _submitting = true);
-                              Navigator.pop(context);
-                              await widget.onSwap(name, cash);
+                              setState(() { _submitting = true; _submitError = null; });
+                              String? error;
+                              try { error = await widget.onSwap(name, cash); }
+                              catch (e) { error = 'Gagal mengganti shift: ${e.toString().replaceFirst('Exception: ', '')}'; }
+                              if (!mounted) return;
+                              if (error == null) {
+                                Navigator.of(this.context).pop();
+                              } else {
+                                setState(() { _submitting = false; _submitError = error; });
+                              }
                             },
                     ),
                   ),
@@ -3930,6 +3990,7 @@ class _SwapShiftDialogState extends State<_SwapShiftDialog> {
             ],
           ),
         ),
+      ),
       ),
     );
   }

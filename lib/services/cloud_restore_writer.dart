@@ -81,16 +81,42 @@ class CloudRestoreWriter {
         await _pending('cashier_shift', id)) {
       return false;
     }
+    // Older servers could return an old open snapshot after a shift closed.
+    // Fail the caller's restore transaction instead of reactivating it or
+    // restoring cash movements without their valid open parent.
+    final status = source['status'];
+    final closedAt = source['closed_at'];
+    if ((status != null && status != 'open') ||
+        (closedAt != null && closedAt != '')) {
+      throw const FormatException(
+          'Data pemulihan memuat shift yang sudah ditutup atau tidak valid.');
+    }
     if ((await db.query('cashier_shifts', where: "status = 'open'", limit: 1))
         .isNotEmpty) {
       throw const FormatException('Ada shift lokal yang masih terbuka. '
           'Periksa shift sebelum memulihkan shift lain.');
     }
+    final opened = _time(source['opened_at']);
+    final openedAt = DateTime.parse(opened);
+    for (final local in await db
+        .query('cashier_shifts', columns: ['opened_at', 'closed_at'])) {
+      final localOpened =
+          DateTime.tryParse(local['opened_at'] as String)?.toLocal();
+      final localClosed = local['closed_at'] == null
+          ? null
+          : DateTime.tryParse(local['closed_at'] as String)?.toLocal();
+      if ((localOpened != null && !localOpened.isBefore(openedAt)) ||
+          (localClosed != null && localClosed.isAfter(openedAt))) {
+        throw const FormatException(
+            'Shift pemulihan bertumpang tindih atau lebih lama dari riwayat lokal. '
+            'Periksa riwayat dan sinkronkan penutupan shift dari perangkat asal.');
+      }
+    }
     final now = DateTime.now().toIso8601String();
     await db.insert('cashier_shifts', {
       'id': id,
       'opened_by': source['opened_by'] ?? source['opened_by_name'] ?? 'Kasir',
-      'opened_at': _time(source['opened_at'], fallback: now),
+      'opened_at': opened,
       'opening_cash': _number(source['opening_cash'] ?? 0, 'kas awal'),
       'previous_shift_id': source['previous_shift_id'],
       'handover_to': source['handover_to'],

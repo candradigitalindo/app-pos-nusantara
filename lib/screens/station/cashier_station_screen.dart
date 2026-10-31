@@ -1042,7 +1042,7 @@ class _CashierStationScreenState extends State<CashierStationScreen> {
         context,
         title: 'Selesai Kerja?',
         message:
-            'Cetak ringkasan kerja Anda lalu keluar ke layar login. Shift laci kas tidak ditutup (di perangkat utama).',
+            'Cetak ringkasan kerja Anda lalu keluar ke layar login. Shift laci kas tetap terbuka. Untuk menutup kasir hari ini, gunakan Tutup Kasir di perangkat utama.',
         confirmText: 'Selesai',
         icon: Icons.logout_rounded,
       );

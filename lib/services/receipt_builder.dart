@@ -241,6 +241,35 @@ class ReceiptBuilder {
     }
     buf.addAll(_Esc.line(_divider()));
 
+    if (report['crosses_day'] == true) {
+      buf.addAll(_Esc.line('SHIFT MELINTASI TANGGAL'));
+      buf.addAll(_Esc.line('Total shift mencakup seluruh periode.'));
+      buf.addAll(_Esc.line(_divider()));
+    }
+    final byDay = (report['by_day'] as List? ?? const []).whereType<Map>();
+    if (byDay.isNotEmpty) {
+      buf.addAll(_Esc.boldOn());
+      buf.addAll(_Esc.line('PENJUALAN PER HARI'));
+      buf.addAll(_Esc.boldOff());
+      for (final day in byDay) {
+        final count = (day['sales_count'] as num? ?? 0).toInt();
+        final total = (day['sales_total'] as num? ?? 0).toDouble();
+        buf.addAll(_Esc.line(_rightAlign('${day['date']} ($count)', _formatAmount(total))));
+        final cashIn = (day['cash_in_total'] as num? ?? 0).toDouble();
+        final cashOut = (day['cash_out_total'] as num? ?? 0).toDouble();
+        if (cashIn != 0) buf.addAll(_Esc.line(_rightAlign(' Kas masuk', _formatAmount(cashIn))));
+        if (cashOut != 0) buf.addAll(_Esc.line(_rightAlign(' Kas keluar', _formatAmount(cashOut))));
+        if (day['outside_shift'] == true) {
+          buf.addAll(_Esc.line(' Mutasi di luar rentang shift'));
+        }
+      }
+      buf.addAll(_Esc.line(_divider()));
+    }
+    if ((report['out_of_period_movement_count'] as num? ?? 0) > 0) {
+      buf.addAll(_Esc.line('Periksa mutasi di luar rentang shift.'));
+      buf.addAll(_Esc.line(_divider()));
+    }
+
     // Penjualan per metode
     final byMethod = (report['by_method'] as Map?) ?? const {};
     buf.addAll(_Esc.boldOn());
@@ -263,7 +292,7 @@ class ReceiptBuilder {
     buf.addAll(_Esc.boldOn());
     buf.addAll(_Esc.line(_rightAlign('Total Transaksi', '$salesCount')));
     buf.addAll(
-        _Esc.line(_rightAlign('Total Penjualan', _formatAmount(salesTotal))));
+        _Esc.line(_rightAlign('Penjualan Shift', _formatAmount(salesTotal))));
     buf.addAll(_Esc.boldOff());
     buf.addAll(_Esc.line(_divider()));
 
@@ -806,7 +835,8 @@ class ReceiptBuilder {
     return buf.toString();
   }
 
-  String _formatDateTime(DateTime dt) {
+  String _formatDateTime(DateTime value) {
+    final dt = value.toLocal();
     final d = dt.day.toString().padLeft(2, '0');
     final mo = dt.month.toString().padLeft(2, '0');
     final y = dt.year;

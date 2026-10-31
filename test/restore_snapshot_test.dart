@@ -204,6 +204,127 @@ void main() {
   });
   tearDownAll(() => server.close(force: true));
 
+  for (final fields in <Map<String, dynamic>>[
+    {'status': 'closed'},
+    {'status': 'open', 'closed_at': '2026-09-19T15:00:00Z'},
+    {'status': 'open', 'closed_at': 'invalid-but-present'},
+    {'status': 'unknown'},
+    {'opened_at': null},
+    {'opened_at': ''},
+    {'opened_at': 'invalid-time'},
+  ]) {
+    test('restore rejects inconsistent shift atomically: $fields', () async {
+      final shift = Map<String, dynamic>.from(
+          (response['data']['open_shifts'] as List).single as Map);
+      response['data']['open_shifts'] = <Map<String, dynamic>>[
+        {...shift, ...fields},
+      ];
+      final result = await CloudSyncService.instance.restoreFromCloud();
+      expect(result['error'], isNotNull);
+      expect(await db.query('cashier_shifts'), isEmpty);
+      expect(await db.query('orders'), isEmpty);
+      expect(await db.query('payments'), isEmpty);
+      expect(await db.query('cashier_cash_movements'), isEmpty);
+      expect(
+          await db.query('additional_charges',
+              where: 'sync_id = ?', whereArgs: [chargeSyncId]),
+          isEmpty);
+    });
+  }
+
+  test('multiple new open shifts roll back the entire fresh restore', () async {
+    final first = Map<String, dynamic>.from(
+        (response['data']['open_shifts'] as List).single as Map);
+    response['data']['open_shifts'] = <Map<String, dynamic>>[
+      first,
+      {
+        ...first,
+        'local_id': Ulid.generate(),
+        'opened_at': '2026-09-20T03:00:00Z',
+      },
+    ];
+    final result = await CloudSyncService.instance.restoreFromCloud();
+    expect(result['error'], contains('shift lokal yang masih terbuka'));
+    expect(await db.query('cashier_shifts'), isEmpty);
+    expect(await db.query('orders'), isEmpty);
+    expect(await db.query('payments'), isEmpty);
+    expect(await db.query('cashier_cash_movements'), isEmpty);
+    expect(await db.query('additional_charges'), isEmpty);
+  });
+
+  test('older missing open shift cannot bypass a newer local closed shift',
+      () async {
+    final newerId = Ulid.generate();
+    await db.insert('cashier_shifts', {
+      'id': newerId,
+      'opened_by': 'Kasir berikutnya',
+      'opened_at': '2026-09-20T03:00:00Z',
+      'closed_at': '2026-09-20T15:00:00Z',
+      'status': 'closed',
+    });
+    final before = await db.query('cashier_shifts');
+    final first = Map<String, dynamic>.from(
+        (response['data']['open_shifts'] as List).single as Map);
+    response['data']['open_shifts'] = <Map<String, dynamic>>[
+      first,
+      {
+        ...first,
+        'local_id': newerId,
+        'opened_at': '2026-09-20T03:00:00Z',
+        'status': 'open',
+      },
+    ];
+    final result = await CloudSyncService.instance.restoreFromCloud();
+    expect(result['error'], contains('riwayat lokal'));
+    expect(await db.query('cashier_shifts'), before);
+    expect(await db.query('orders'), isEmpty);
+    expect(await db.query('cashier_cash_movements'), isEmpty);
+  });
+
+  for (final local in <Map<String, dynamic>>[
+    {
+      'opened_at': '2026-09-19T01:00:00Z',
+      'closed_at': '2026-09-19T04:00:00Z',
+    },
+    {'opened_at': '2026-09-19T03:00:00Z', 'closed_at': null},
+  ]) {
+    test('restore rejects known local overlap: $local', () async {
+      await db.insert('cashier_shifts', {
+        'id': Ulid.generate(),
+        'opened_by': 'Kasir sebelumnya',
+        'status': 'closed',
+        ...local,
+      });
+      final before = await db.query('cashier_shifts');
+      final result = await CloudSyncService.instance.restoreFromCloud();
+      expect(result['error'], contains('riwayat lokal'));
+      expect(await db.query('cashier_shifts'), before);
+      expect(await db.query('orders'), isEmpty);
+    });
+  }
+
+  for (final closeAt in ['2026-09-19T02:00:00Z', '2026-09-19T03:00:00Z']) {
+    test('next shift may open at or after previous closure $closeAt', () async {
+      final previousId = Ulid.generate();
+      await db.insert('cashier_shifts', {
+        'id': previousId,
+        'opened_by': 'Kasir sebelumnya',
+        'opened_at': '2026-09-18T03:00:00Z',
+        'closed_at': closeAt,
+        'status': 'closed',
+      });
+      await seedCharge(chargeSyncId);
+      final result = await CloudSyncService.instance.restoreFromCloud();
+      expect(result, {'shifts': 1, 'orders': 1, 'movements': 1});
+      final shifts = await db.query('cashier_shifts');
+      expect(shifts, hasLength(2));
+      expect(shifts.singleWhere((row) => row['id'] == previousId)['status'],
+          'closed');
+      expect(
+          shifts.singleWhere((row) => row['id'] == shiftId)['status'], 'open');
+    });
+  }
+
   test(
       'string snapshot restores DP and charges, top-up and settlement preserve history',
       () async {

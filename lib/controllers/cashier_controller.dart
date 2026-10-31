@@ -299,10 +299,10 @@ class CashierController extends ChangeNotifier {
 
   Future<List<User>> getCashierUsers() => _cashierRepo.getCashierUsers();
 
-  Future<List<CashMovement>> getShiftMovements() async {
-    final shift = _state.activeShift;
-    if (shift == null) return [];
-    return _cashierRepo.getShiftMovements(shift.id);
+  Future<List<CashMovement>> getShiftMovements({String? shiftId}) async {
+    final id = shiftId ?? _state.activeShift?.id;
+    if (id == null) return [];
+    return _cashierRepo.getShiftMovements(id);
   }
 
   Future<void> addCashMovement({
@@ -331,18 +331,18 @@ class CashierController extends ChangeNotifier {
     }
   }
 
-  Future<Map<String, double>> getShiftTotals() async {
-    final shift = _state.activeShift;
-    if (shift == null) return {};
-    return _cashierRepo.getShiftTotals(shift.id);
+  Future<Map<String, double>> getShiftTotals({String? shiftId}) async {
+    final id = shiftId ?? _state.activeShift?.id;
+    if (id == null) return {};
+    return _cashierRepo.getShiftTotals(id);
   }
 
   /// Laporan shift lengkap (termasuk metrik diskon/kompliment/void) untuk
   /// ditampilkan di dialog tutup kasir / ganti shift.
-  Future<Map<String, dynamic>> getShiftReport() async {
-    final shift = _state.activeShift;
-    if (shift == null) return {};
-    return _cashierRepo.getShiftReport(shift.id);
+  Future<Map<String, dynamic>> getShiftReport({String? shiftId}) async {
+    final id = shiftId ?? _state.activeShift?.id;
+    if (id == null) return {};
+    return _cashierRepo.getShiftReport(id);
   }
 
   Future<void> openShift({
@@ -367,57 +367,77 @@ class CashierController extends ChangeNotifier {
   /// Meja yang tagihannya belum lunas — syarat tutup kasir.
   Future<List<String>> unpaidTables() => _cashierRepo.unpaidTables();
 
-  Future<void> closeShift() async {
-    final shift = _state.activeShift;
-    if (shift == null) return;
+  /// Returns an error for the dialog, or null only after the close commits.
+  /// An explicit ID pins the operation to the shift the cashier reviewed.
+  Future<String?> closeShift({String? shiftId}) async {
+    final id = shiftId ?? _state.activeShift?.id;
+    if (id == null) return 'Tidak ada shift aktif.';
+    if (_state.isProcessing) return 'Proses lain masih berjalan. Coba lagi.';
     _setState(_state.copyWith(isProcessing: true, clearError: true));
     try {
+      final shift = await _cashierRepo.getActiveShift();
+      if (shift == null || shift.id != id) {
+        throw Exception('Shift sudah berubah. Tutup dialog lalu muat ulang.');
+      }
       // Tutup dulu (set closed_at + kirim laporan ke cloud), BARU cetak — agar
       // angka struk == angka yang dikirim ke cloud (jendela [buka, closed_at)
       // yang sama). Kalau dibalik, cetak pakai jendela [buka, now) sedangkan
       // cloud pakai [buka, closed_at) → bisa beda bila ada transaksi di sela.
       // Cetak lewat antrian durable, jadi tetap tercetak walau printer sesaat off.
       final closed = await _cashierRepo.closeShift(
-        shiftId: shift.id,
+        shiftId: id,
         closedBy: await _currentCashierName(), // akun yang sedang login
       );
+      // Closing has committed. Printing must never present it as failed or
+      // leave this closed shift in the controller if the printer is offline.
+      _setState(_state.copyWith(
+        isProcessing: false,
+        clearActiveShift: _state.activeShift?.id == id,
+      ));
       await _printShiftReport(
-        shift,
+        closed,
         title: 'TUTUP KASIR',
         closedAt: closed.closedAt,
       );
-      _setState(_state.copyWith(
-        isProcessing: false,
-        clearActiveShift: true,
-      ));
+      return null;
     } catch (e) {
+      final message = 'Gagal menutup shift: '
+          '${e.toString().replaceFirst('Exception: ', '')}';
       _setState(_state.copyWith(
         isProcessing: false,
-        errorMessage: 'Gagal menutup shift: $e',
+        errorMessage: message,
       ));
+      return message;
     }
   }
 
-  Future<void> swapShift({
+  Future<String?> swapShift({
+    String? shiftId,
     required String handoverTo,
     required double newOpeningCash,
     String? notes,
   }) async {
-    final shift = _state.activeShift;
-    if (shift == null) return;
+    final id = shiftId ?? _state.activeShift?.id;
+    if (id == null) return 'Tidak ada shift aktif.';
+    if (_state.isProcessing) return 'Proses lain masih berjalan. Coba lagi.';
     _setState(_state.copyWith(isProcessing: true, clearError: true));
     try {
+      final shift = await _cashierRepo.getActiveShift();
+      if (shift == null || shift.id != id) {
+        throw Exception('Shift sudah berubah. Tutup dialog lalu muat ulang.');
+      }
       // Tutup shift lama + buka shift baru terhubung (carry-over, handover_to,
       // previous_shift_id) lewat satu operasi; keduanya dikirim ke cloud.
       // Handover DULU (set closed_at + kirim laporan cloud), BARU cetak — agar
       // angka struk == angka yang dikirim ke cloud (jendela [buka, closed_at)
       // sama). Cetak lewat antrian durable, tetap tercetak walau printer off.
       final newShift = await _cashierRepo.handoverShift(
-        currentShiftId: shift.id,
+        currentShiftId: id,
         handoverToUserId: handoverTo,
         countedCash: newOpeningCash,
         notes: notes,
       );
+      _setState(_state.copyWith(isProcessing: false, activeShift: newShift));
       await _printShiftReport(
         shift,
         title: 'GANTI SHIFT',
@@ -431,13 +451,15 @@ class CashierController extends ChangeNotifier {
         // sama di handoverShift), jadi ini closed_at ASLI, bukan waktu cetak.
         closedAt: newShift.openedAt,
       );
-      _setState(_state.copyWith(isProcessing: false));
-      await loadData();
+      return null;
     } catch (e) {
+      final message = 'Gagal mengganti shift: '
+          '${e.toString().replaceFirst('Exception: ', '')}';
       _setState(_state.copyWith(
         isProcessing: false,
-        errorMessage: 'Gagal mengganti shift: $e',
+        errorMessage: message,
       ));
+      return message;
     }
   }
 
