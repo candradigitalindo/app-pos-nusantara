@@ -52,6 +52,8 @@ void main() {
       () async {
     final product = await ProductRepository()
         .createProduct(name: 'Restore E2E', price: 100000);
+    await db.update('products', {'menu_kind': 'food'},
+        where: 'id = ?', whereArgs: [product.id]);
     final reserved = 'restore-${Ulid.generate()}';
     await repo.createAdditionalCharge(
         name: 'PB1 restore E2E',
@@ -82,6 +84,7 @@ void main() {
     await db.delete('sync_queue', where: "entity_type = 'order'");
     await repo.enqueueUnsyncedActiveOrders();
     final originalItem = (await repo.getOrderItems(order.id)).single;
+    expect(originalItem.menuKind, 'food');
     final originalPayment = (await db.query('payments')).single;
     final pushed = await CloudSyncService.instance.pushNow();
     expect(pushed['failed'], 0, reason: '$pushed');
@@ -113,6 +116,7 @@ void main() {
     final item = (await repo.getOrderItems(order.id)).single;
     expect(item.id, originalItem.id);
     expect(item.productId, product.id);
+    expect(item.menuKind, 'food');
     expect(item.notes, 'Catatan dari POS');
     expect(item.createdAt.toUtc(), originalItem.createdAt.toUtc());
     final payment = (await db.query('payments')).single;

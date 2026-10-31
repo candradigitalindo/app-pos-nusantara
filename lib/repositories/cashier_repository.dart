@@ -164,6 +164,8 @@ class CashierRepository {
       final carryOverCash = closingCash ??
           await _expectedDrawerCash(shift, totals, executor: txn);
 
+      await _freezeLegacyMenuKinds(txn, shift, now);
+
       await txn.update(
         'cashier_shifts',
         {
@@ -211,6 +213,8 @@ class CashierRepository {
       // (hitung fisik bila ada; selain itu modal + tunai + kas masuk − keluar).
       final carryOverCash = countedCash ??
           await _expectedDrawerCash(current, totals, executor: txn);
+
+      await _freezeLegacyMenuKinds(txn, current, now);
 
       // 1. Tutup shift lama, tandai handover_to
       await txn.update(
@@ -383,6 +387,77 @@ class CashierRepository {
         'cash_out_total': 0.0,
         'outside_shift': false,
       };
+
+  static const _finalizedOrderWithinShift = '''
+    o.payment_status='paid' AND o.voided_at IS NULL AND o.is_holding=0
+    AND EXISTS (
+      SELECT 1 FROM transactions t WHERE t.order_id=o.id
+        AND t.status='completed' AND t.cancelled_at IS NULL
+        AND t.transaction_date >= ? AND t.transaction_date < ?
+    )
+  ''';
+
+  /// Old order rows have no kind snapshot. Resolve them once at close while
+  /// the transaction is locked, before closing the shift and writing its
+  /// report to the outbox. A subsequent catalog edit cannot change a reprint.
+  Future<void> _freezeLegacyMenuKinds(
+      DatabaseExecutor db, CashierShift shift, DateTime cutoff) async {
+    await db.rawUpdate('''
+      UPDATE order_items SET menu_kind=COALESCE((
+        SELECT CASE WHEN p.menu_kind IN ('food','beverage','activity','other')
+          THEN p.menu_kind ELSE 'other' END
+        FROM products p WHERE p.id=order_items.product_id
+      ),'other')
+      WHERE menu_kind IS NULL AND order_id IN (
+        SELECT o.id FROM orders o WHERE $_finalizedOrderWithinShift
+      )
+    ''', [
+      shift.openedAt.toLocal().toIso8601String(),
+      cutoff.toLocal().toIso8601String(),
+    ]);
+  }
+
+  Future<List<Map<String, dynamic>>> _soldMenus(DatabaseExecutor db,
+      CashierShift shift, String since, String until) async {
+    final rows = await db.rawQuery('''
+      SELECT oi.product_id,oi.product_name,
+        CASE WHEN oi.menu_kind IN ('food','beverage','activity','other')
+          THEN oi.menu_kind
+          WHEN ?=1 AND oi.menu_kind IS NULL
+            AND p.menu_kind IN ('food','beverage','activity','other')
+          THEN p.menu_kind ELSE 'other' END AS resolved_kind,
+        SUM(oi.qty) AS quantity
+      FROM order_items oi JOIN orders o ON o.id=oi.order_id
+      LEFT JOIN products p ON p.id=oi.product_id
+      WHERE $_finalizedOrderWithinShift
+      GROUP BY 1,2,3 ORDER BY oi.product_name COLLATE NOCASE,oi.product_id
+    ''', [shift.isOpen ? 1 : 0, since, until]);
+    final groups = <String, Map<String, dynamic>>{
+      for (final entry in const {
+        'food': 'Makanan',
+        'beverage': 'Minuman',
+        'activity': 'Aktivitas',
+        'other': 'Lainnya',
+      }.entries)
+        entry.key: {
+          'menu_kind': entry.key,
+          'label': entry.value,
+          'quantity': 0,
+          'items': <Map<String, dynamic>>[],
+        },
+    };
+    for (final row in rows) {
+      final group = groups[row['resolved_kind']]!;
+      final quantity = (row['quantity'] as num).toInt();
+      group['quantity'] = (group['quantity'] as int) + quantity;
+      (group['items'] as List<Map<String, dynamic>>).add({
+        'product_id': row['product_id'] as String?,
+        'product_name': row['product_name'] as String,
+        'quantity': quantity,
+      });
+    }
+    return groups.values.toList();
+  }
 
   /// Laporan shift lengkap untuk struk & sync cloud:
   /// per metode bayar (jumlah transaksi + total), kas masuk/keluar, ekspektasi kas.
@@ -591,6 +666,11 @@ class CashierRepository {
     ''');
     final heldCount = (heldRows.first['cnt'] as num?)?.toInt() ?? 0;
     final heldTotal = (heldRows.first['total'] as num?)?.toDouble() ?? 0;
+    // Quantities come from finalized order-item snapshots, not payments:
+    // partial/split payments cannot duplicate menus, and free orders count.
+    // Closed legacy rows without a snapshot are Lainnya; current catalog
+    // values cannot reliably establish their historical classification.
+    final soldMenus = await _soldMenus(db, shift, since, until);
 
     return {
       'shift_id': shiftId,
@@ -599,6 +679,9 @@ class CashierRepository {
       'crosses_day': crossesDay,
       'by_day': [for (final date in daily.keys.toList()..sort()) daily[date]!],
       'out_of_period_movement_count': outOfPeriodMovementCount,
+      'menu_items_by_kind': soldMenus,
+      'menu_quantity': soldMenus.fold<int>(
+          0, (total, group) => total + (group['quantity'] as int)),
       'opening_cash': shift.openingCash,
       'sales_count': salesCount,
       'sales_total': salesTotal,

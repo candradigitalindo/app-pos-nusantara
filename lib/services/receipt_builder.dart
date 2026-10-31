@@ -296,6 +296,8 @@ class ReceiptBuilder {
     buf.addAll(_Esc.boldOff());
     buf.addAll(_Esc.line(_divider()));
 
+    _addShiftMenuSummary(buf, report);
+
     // Pengawasan: diskon, kompliment, void (tidak memengaruhi kas laci)
     final discountCount = (report['discount_count'] as num?)?.toInt() ?? 0;
     final discountTotal = (report['discount_total'] as num?)?.toDouble() ?? 0;
@@ -633,6 +635,77 @@ class ReceiptBuilder {
   }
 
   // ── Private helpers ─────────────────────────────────────────────────────────
+
+  void _addShiftMenuSummary(List<int> buf, Map<String, dynamic> report) {
+    // Laporan lama belum membawa rincian menu; jangan menyatakannya nol.
+    final groups = report['menu_items_by_kind'];
+    if (groups is! List) return;
+    final byKind = <String, Map>{
+      for (final group in groups.whereType<Map>())
+        if (group['menu_kind'] is String) group['menu_kind'] as String: group,
+    };
+    const labels = {
+      'food': 'Makanan',
+      'beverage': 'Minuman',
+      'activity': 'Aktivitas',
+      'other': 'Lainnya',
+    };
+    buf.addAll(_Esc.boldOn());
+    buf.addAll(_Esc.line('MENU TERJUAL'));
+    buf.addAll(_Esc.boldOff());
+    buf.addAll(_Esc.line('Transaksi selesai pada shift ini'));
+    buf.addAll(_Esc.line(_rightAlign('Nama menu', 'Qty')));
+    for (final entry in labels.entries) {
+      final group = byKind[entry.key] ?? const {};
+      final items = (group['items'] as List? ?? const []).whereType<Map>();
+      buf.addAll(_Esc.boldOn());
+      buf.addAll(_Esc.line(entry.value));
+      buf.addAll(_Esc.boldOff());
+      if (items.isEmpty) {
+        buf.addAll(_Esc.line('-'));
+      }
+      for (final item in items) {
+        // Nama berasal dari snapshot transaksi, bukan master produk terkini.
+        // Encoder printer memakai byte tunggal. Jangan biarkan Unicode di
+        // luar Latin-1 terpotong menjadi ESC/LF atau kontrol printer lainnya.
+        final name = String.fromCharCodes(
+                (item['product_name'] as String? ?? '')
+                    .runes
+                    .map((rune) => rune > 0xff ? 0x3f : rune))
+            .replaceAll(RegExp(r'[\x00-\x1F\x7F-\x9F]'), ' ')
+            .replaceAll(RegExp(r'\s+'), ' ')
+            .trim();
+        final quantity = ((item['quantity'] as num?)?.toInt() ?? 0).toString();
+        final lines = _wrapMenuName(
+            name.isEmpty ? '-' : name, paperWidth - quantity.length - 1);
+        buf.addAll(_Esc.line(_rightAlign(lines.first, quantity)));
+        for (final line in lines.skip(1)) {
+          buf.addAll(_Esc.line(line));
+        }
+      }
+      final quantity = (group['quantity'] as num?)?.toInt() ?? 0;
+      buf.addAll(_Esc.line(_rightAlign('Qty ${entry.value}', '$quantity')));
+    }
+    buf.addAll(_Esc.boldOn());
+    final quantity = (report['menu_quantity'] as num?)?.toInt() ?? 0;
+    buf.addAll(_Esc.line(_rightAlign('TOTAL QTY MENU', '$quantity')));
+    buf.addAll(_Esc.boldOff());
+    buf.addAll(_Esc.line(_divider()));
+  }
+
+  /// Sisakan kolom kuantitas, tanpa memotong nama atau kata yang panjang.
+  List<String> _wrapMenuName(String name, int width) {
+    final lines = <String>[];
+    var remaining = name;
+    while (remaining.length > width) {
+      var end = remaining.lastIndexOf(' ', width);
+      if (end <= 0) end = width;
+      lines.add(remaining.substring(0, end));
+      remaining = remaining.substring(end).trimLeft();
+    }
+    if (remaining.isNotEmpty) lines.add(remaining);
+    return lines;
+  }
 
   void _addHeader(List<int> buf, ReceiptData data) {
     buf.addAll(_Esc.init());

@@ -145,9 +145,11 @@ class ProductRepository {
   }
 
   Future<void> updateProduct(Product product) async {
-    // Cloud owns photos. An edit dialog may still hold the previous URL
-    // after a photo update/delete has already committed through sync.
-    final changes = product.toMap()..remove('photo_url');
+    // Cloud owns photos and menu kinds. An edit dialog may still hold old
+    // catalog values after a newer pull has already committed.
+    final changes = product.toMap()
+      ..remove('photo_url')
+      ..remove('menu_kind');
     await _db.update(
       'products',
       changes,

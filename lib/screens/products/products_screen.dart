@@ -211,6 +211,7 @@ class _ProductsScreenState extends State<ProductsScreen>
                     categoryId: selectedCatId,
                     stock: product.stock,
                     photoUrl: product.photoUrl,
+                    menuKind: product.menuKind,
                     isDeleted: product.isDeleted,
                     createdAt: product.createdAt,
                     updatedAt: DateTime.now(),

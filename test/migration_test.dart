@@ -1,4 +1,4 @@
-// Verifikasi migrasi DB v10 → v15 terhadap SQLITE ASLI berisi data.
+// Verifikasi migrasi DB v10 → v16 terhadap SQLITE ASLI berisi data.
 //
 // Migrasi-migrasi ini menyentuh tabel yang sudah dipakai di lapangan:
 //
@@ -48,9 +48,32 @@ void main() {
     await testDirectory.delete(recursive: true);
   });
 
-  test('versi skema naik ke 15', () async {
+  test('versi skema naik ke 16', () async {
     final versi = (await db.rawQuery('PRAGMA user_version')).first.values.first;
-    expect(versi, 15);
+    expect(versi, 16);
+  });
+
+  test('migrasi v16 menjaga data dan jenis item historis tetap tidak diketahui',
+      () async {
+    final product = (await db.query('products')).single;
+    expect(product['id'], 'PRD1');
+    expect(product['name'], 'Nasi Goreng');
+    expect(product['price'], 25000);
+    expect(product['menu_kind'], '');
+    final item = (await db.query('order_items')).single;
+    expect(item['id'], 'ITEMLAMA');
+    expect(item['product_name'], 'Nasi Goreng');
+    expect(item['qty'], 2);
+    expect(item['menu_kind'], isNull);
+    final transaction = (await db.query('transactions')).single;
+    expect(transaction['order_id'], 'ORDERLAMA');
+    expect(transaction['transaction_date'], '2026-08-01');
+    final indexes = await db.rawQuery('PRAGMA index_list(transactions)');
+    expect(indexes.map((row) => row['name']),
+        contains('idx_transactions_order_date'));
+    await db.update('products', {'menu_kind': 'food'},
+        where: 'id = ?', whereArgs: ['PRD1']);
+    expect((await db.query('order_items')).single['menu_kind'], isNull);
   });
 
   test('migrasi v15 mempertahankan produk lama dengan foto kosong', () async {
@@ -308,6 +331,18 @@ Future<void> _bangunDatabaseV10(String path) async {
       FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
     )
   ''');
+  await old.execute('''
+    CREATE TABLE transactions (
+      id TEXT PRIMARY KEY,
+      order_id TEXT NOT NULL,
+      transaction_date TEXT NOT NULL
+    )
+  ''');
+  await old.insert('transactions', {
+    'id': 'TRANSACTIONLAMA',
+    'order_id': 'ORDERLAMA',
+    'transaction_date': '2026-08-01',
+  });
   await old.execute(
       'CREATE INDEX IF NOT EXISTS idx_payments_order_id ON payments(order_id)');
   await old.insert('orders', {

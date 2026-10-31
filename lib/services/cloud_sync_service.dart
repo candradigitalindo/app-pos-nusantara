@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../database/database.dart';
+import '../models/models.dart' show normalizeMenuKind;
 import '../repositories/order_repository.dart';
 import '../repositories/cashier_repository.dart';
 import '../repositories/sync_queue_repository.dart';
@@ -33,8 +34,8 @@ class CloudSyncService {
     receiveTimeout: const Duration(seconds: 30),
   ));
 
-  // New photo-capable clients must replay old products once after upgrading.
-  static const _lastSyncKey = 'cloud_last_pull_at:photos-v1';
+  // Replay existing products once after upgrading to import their menu kinds.
+  static const _lastSyncKey = 'cloud_last_pull_at:menu-kinds-v1';
   Future<void>? _masterPull;
   static const _lastSyncAtKey = 'cloud_last_sync_at';
 
@@ -745,6 +746,8 @@ class CloudSyncService {
     final desc = prod['description'] as String?;
     final hasPhoto = prod.containsKey('photo_url');
     final photoUrl = ProductPhotoCache.resolveUrl(prod['photo_url'], cloudBase);
+    final hasMenuKind = prod.containsKey('menu_kind');
+    final menuKind = normalizeMenuKind(prod['menu_kind']);
     var categoryId = prod['category_id'] as String?;
     if (categoryId != null && categoryId.isEmpty) categoryId = null;
     final categoryName = prod['category_name'] as String?;
@@ -784,13 +787,14 @@ class CloudSyncService {
 
     Future<void> upsert(String? catId) => db.rawInsert(
           '''
-          INSERT INTO products (id, name, code, description, price, stock, category_id, is_deleted, created_at, updated_at, photo_url)
-          VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+          INSERT INTO products (id, name, code, description, price, stock, category_id, is_deleted, created_at, updated_at, photo_url, menu_kind)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
           ON CONFLICT(id) DO UPDATE SET
             name=excluded.name, code=excluded.code, description=excluded.description,
             price=excluded.price, stock=excluded.stock, category_id=excluded.category_id,
             is_deleted=0, updated_at=excluded.updated_at,
-            photo_url=CASE WHEN ? = 1 THEN excluded.photo_url ELSE products.photo_url END
+            photo_url=CASE WHEN ? = 1 THEN excluded.photo_url ELSE products.photo_url END,
+            menu_kind=CASE WHEN ? = 1 THEN excluded.menu_kind ELSE products.menu_kind END
           ''',
           [
             id,
@@ -803,7 +807,9 @@ class CloudSyncService {
             now,
             now,
             photoUrl,
-            hasPhoto ? 1 : 0
+            menuKind,
+            hasPhoto ? 1 : 0,
+            hasMenuKind ? 1 : 0
           ],
         );
 

@@ -17,6 +17,11 @@ class OrderRepository {
   final SyncQueueRepository _sync = SyncQueueRepository();
   final PrinterService _printer = PrinterService();
 
+  static String _snapshotMenuKind(String? kind) =>
+      const ['food', 'beverage', 'activity', 'other'].contains(kind)
+          ? kind!
+          : 'other';
+
   // ==================== CREATE ORDER ====================
 
   Future<Order> createOrder({
@@ -48,6 +53,7 @@ class OrderRepository {
         productId: product.id,
         productName: product.name,
         categoryId: product.categoryId,
+        menuKind: _snapshotMenuKind(product.menuKind),
         qty: input.qty,
         price: product.price + SelectedAddon.totalOf(input.addons),
         destination: await _determineDestination(product),
@@ -332,6 +338,7 @@ class OrderRepository {
         productId: product.id,
         productName: product.name,
         categoryId: product.categoryId,
+        menuKind: _snapshotMenuKind(product.menuKind),
         qty: input.qty,
         price: product.price + SelectedAddon.totalOf(input.addons),
         destination: await _determineDestination(product),
@@ -594,6 +601,7 @@ class OrderRepository {
                     'id': it.id,
                     if (it.productId != null) 'product_id': it.productId,
                     'product_name': it.productName,
+                    'menu_kind': it.menuKind,
                     'qty': it.qty,
                     'price': it.price,
                     'subtotal': it.subtotal,
@@ -773,6 +781,7 @@ class OrderRepository {
       productId: item.productId,
       productName: item.productName,
       categoryId: item.categoryId,
+      menuKind: item.menuKind,
       qty: qty,
       price: item.price,
       destination: item.destination,
@@ -817,6 +826,7 @@ class OrderRepository {
           'order_id': order.id,
           'table_number': order.tableNumber,
           'product_name': item.productName,
+          'menu_kind': item.menuKind,
           'qty': q,
           'price': item.price,
           'subtotal': item.price * q,
@@ -1097,6 +1107,7 @@ class OrderRepository {
                     'id': i.id,
                     if (i.productId != null) 'product_id': i.productId,
                     'product_name': i.productName,
+                    'menu_kind': i.menuKind,
                     'quantity': i.qty,
                     'price': i.price,
                     'subtotal': i.subtotal,
@@ -1744,6 +1755,7 @@ class OrderRepository {
           'local_id': item.id,
           'action': action,
           'product_name': item.productName,
+          'menu_kind': item.menuKind,
           'qty': item.qty,
           'price': item.price,
           'subtotal': item.subtotal,

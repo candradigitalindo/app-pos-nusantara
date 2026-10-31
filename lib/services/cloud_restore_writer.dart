@@ -240,6 +240,14 @@ class CloudRestoreWriter {
         'product_id': item['product_id'],
         'category_id': item['category_id'],
         'product_name': item['product_name'] ?? item['name'] ?? '-',
+        // Missing kind marks legacy data; explicit unknown values belong to
+        // Other without guessing from the product name or print destination.
+        'menu_kind': item['menu_kind'] == null
+            ? null
+            : (const ['food', 'beverage', 'activity', 'other']
+                    .contains(item['menu_kind'])
+                ? item['menu_kind']
+                : 'other'),
         'qty': qty.toInt(),
         'price': price,
         'destination':

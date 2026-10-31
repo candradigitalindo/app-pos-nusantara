@@ -204,6 +204,17 @@ void main() {
   });
   tearDownAll(() => server.close(force: true));
 
+  for (final kind in ['food', 'beverage', 'activity', 'other', 'unknown', null]) {
+    test('restored item preserves menu kind snapshot: $kind', () async {
+      final item = (getOrder()['items'] as List).single as Map;
+      if (kind != null) item['menu_kind'] = kind;
+      final result = await CloudSyncService.instance.restoreFromCloud();
+      expect(result['error'], isNull, reason: '$result');
+      final restored = (await repo.getOrderItems(orderId)).single;
+      expect(restored.menuKind, kind == 'unknown' ? 'other' : kind);
+    });
+  }
+
   for (final fields in <Map<String, dynamic>>[
     {'status': 'closed'},
     {'status': 'open', 'closed_at': '2026-09-19T15:00:00Z'},

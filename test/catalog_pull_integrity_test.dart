@@ -83,7 +83,7 @@ void main() {
     });
     server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     final url = 'http://127.0.0.1:${server!.port}';
-    cursorKey = 'cloud_last_pull_at:photos-v1:$url:outlet-test';
+    cursorKey = 'cloud_last_pull_at:menu-kinds-v1:$url:outlet-test';
     photoCache = ProductPhotoCache(
         directoryProvider: () async => Directory('${directory.path}/photos'),
         retryDelay: Duration.zero,

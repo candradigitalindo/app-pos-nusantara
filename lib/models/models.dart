@@ -98,12 +98,19 @@ class Category {
 
 // ==================== PRODUCT ====================
 
+/// Cloud catalog kinds. Unknown values stay unclassified for Other reporting.
+String normalizeMenuKind(Object? value) =>
+    const {'food', 'beverage', 'activity', 'other'}.contains(value)
+        ? value as String
+        : '';
+
 class Product {
   final String id;
   final String name;
   final String? code;
   final String? description;
   final String photoUrl;
+  final String menuKind;
   final double price;
   final int stock;
   final String? categoryId;
@@ -117,6 +124,7 @@ class Product {
     this.code,
     this.description,
     this.photoUrl = '',
+    this.menuKind = '',
     required this.price,
     this.stock = 0,
     this.categoryId,
@@ -132,6 +140,7 @@ class Product {
         code: code,
         description: description,
         photoUrl: value,
+        menuKind: menuKind,
         price: price,
         stock: stock,
         categoryId: categoryId,
@@ -146,6 +155,7 @@ class Product {
         'code': code,
         'description': description,
         'photo_url': isDeleted == 1 ? '' : photoUrl,
+        'menu_kind': normalizeMenuKind(menuKind),
         'price': price,
         'stock': stock,
         'category_id': categoryId,
@@ -161,6 +171,7 @@ class Product {
         description: map['description'] as String?,
         photoUrl:
             map['is_deleted'] == 1 ? '' : (map['photo_url'] as String? ?? ''),
+        menuKind: normalizeMenuKind(map['menu_kind']),
         price: (map['price'] as num).toDouble(),
         stock: map['stock'] as int,
         categoryId: map['category_id'] as String?,
@@ -341,6 +352,9 @@ class OrderItem {
   final String orderId;
   final String? productId;
   final String productName;
+
+  /// Kind at sale time; null identifies legacy items without a snapshot.
+  final String? menuKind;
   final String?
       categoryId; // kategori asal item (untuk routing cetak per-printer)
   final int qty;
@@ -359,6 +373,7 @@ class OrderItem {
     required this.orderId,
     this.productId,
     required this.productName,
+    this.menuKind,
     this.categoryId,
     required this.qty,
     required this.price,
@@ -406,6 +421,7 @@ class OrderItem {
         'order_id': orderId,
         'product_id': productId,
         'product_name': productName,
+        'menu_kind': menuKind == null ? null : normalizeMenuKind(menuKind),
         'category_id': categoryId,
         'qty': qty,
         'price': price,
@@ -424,6 +440,9 @@ class OrderItem {
         orderId: map['order_id'] as String,
         productId: map['product_id'] as String?,
         productName: map['product_name'] as String,
+        menuKind: map['menu_kind'] == null
+            ? null
+            : normalizeMenuKind(map['menu_kind']),
         categoryId: map['category_id'] as String?,
         qty: map['qty'] as int,
         price: (map['price'] as num).toDouble(),

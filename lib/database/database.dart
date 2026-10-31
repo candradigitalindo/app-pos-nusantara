@@ -32,7 +32,7 @@ class AppDatabase {
 
     return openDatabase(
       path,
-      version: 15,
+      version: 16,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
       onConfigure: _onConfigure,
@@ -184,6 +184,15 @@ class AppDatabase {
       await db.execute(
           "ALTER TABLE products ADD COLUMN photo_url TEXT NOT NULL DEFAULT ''");
     }
+    if (oldVersion < 16) {
+      await db.execute(
+          "ALTER TABLE products ADD COLUMN menu_kind TEXT NOT NULL DEFAULT ''");
+      // Historical items must not inherit a product's current classification.
+      await db.execute('ALTER TABLE order_items ADD COLUMN menu_kind TEXT');
+      await db.execute(
+        'CREATE INDEX IF NOT EXISTS idx_transactions_order_date ON transactions(order_id, transaction_date)',
+      );
+    }
   }
 
   // Add-on/modifier per produk. Harga add-on DILIPAT ke harga item saat
@@ -324,6 +333,7 @@ class AppDatabase {
         id TEXT PRIMARY KEY CHECK (length(id) = 26),
         name TEXT NOT NULL,
         photo_url TEXT NOT NULL DEFAULT '',
+        menu_kind TEXT NOT NULL DEFAULT '',
         code TEXT UNIQUE,
         description TEXT,
         price REAL NOT NULL,
@@ -404,6 +414,7 @@ class AppDatabase {
         order_id TEXT NOT NULL,
         product_id TEXT,
         product_name TEXT NOT NULL,
+        menu_kind TEXT,
         category_id TEXT,
         qty INTEGER NOT NULL CHECK (qty > 0),
         price REAL NOT NULL CHECK (price >= 0),
@@ -474,6 +485,9 @@ class AppDatabase {
     ''');
     await db.execute(
       'CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(transaction_date)',
+    );
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_transactions_order_date ON transactions(order_id, transaction_date)',
     );
 
     // Transaction Items

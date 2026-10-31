@@ -248,6 +248,7 @@ class KitchenController extends ChangeNotifier {
             orderId: item.orderId,
             productId: item.productId,
             productName: item.productName,
+            menuKind: item.menuKind,
             categoryId: item.categoryId,
             qty: item.qty,
             price: item.price,
