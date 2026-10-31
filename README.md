@@ -51,4 +51,9 @@ untuk batas pemeriksaan dan cara menjalankan seluruh pemeriksaan Go/Vue/Flutter.
 QRIS dalam pengujian adalah **simulasi**, bukan penerimaan uang. Uji tablet,
 printer, laci uang, build APK Android, dan penyedia pembayaran nyata tetap
 diperlukan sebelum rilis perangkat. Restore belum menggantikan cadangan lengkap
-rincian pembayaran; pembaruan DP ditolak bila riwayat lokal belum lengkap.
+rincian pembayaran historis yang belum pernah tersinkron. Snapshot order baru
+menyimpan rincian pembayaran, biaya, reservasi, dan item untuk restore; saldo
+lama tanpa rincian tetap dilindungi dari pelunasan/DP ganda. Restore mengisi
+data yang belum ada dan mempertahankan pekerjaan lokal. Penarikan menu yang
+terpotong tidak menghapus menu atau memajukan checkpoint. Mutasi kas dan
+perubahan shift disimpan atomik bersama antrean sinkronisasinya.

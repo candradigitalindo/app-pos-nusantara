@@ -1,3 +1,5 @@
+import 'package:sqflite/sqflite.dart';
+
 import '../database/database.dart';
 import '../models/models.dart';
 import '../utils/ulid.dart';
@@ -14,8 +16,9 @@ class CashierRepository {
 
   // ==================== SHIFT MANAGEMENT ====================
 
-  Future<CashierShift?> getActiveShift() async {
-    final results = await _db.query(
+  Future<CashierShift?> getActiveShift({DatabaseExecutor? executor}) async {
+    final db = executor ?? await _db.database;
+    final results = await db.query(
       'cashier_shifts',
       where: "status = 'open'",
       orderBy: 'opened_at DESC',
@@ -29,25 +32,28 @@ class CashierRepository {
     required String openedBy,
     required double openingCash,
   }) async {
-    final activeShift = await getActiveShift();
-    if (activeShift != null) {
-      throw Exception('Shift sudah dibuka oleh ${activeShift.openedBy}');
-    }
+    final db = await _db.database;
+    return db.transaction((txn) async {
+      final activeShift = await getActiveShift(executor: txn);
+      if (activeShift != null) {
+        throw Exception('Shift sudah dibuka oleh ${activeShift.openedBy}');
+      }
 
-    final now = DateTime.now();
-    final shift = CashierShift(
-      id: Ulid.generate(),
-      openedBy: openedBy,
-      openedAt: now,
-      openingCash: openingCash,
-      status: 'open',
-      createdAt: now,
-      updatedAt: now,
-    );
+      final now = DateTime.now();
+      final shift = CashierShift(
+        id: Ulid.generate(),
+        openedBy: openedBy,
+        openedAt: now,
+        openingCash: openingCash,
+        status: 'open',
+        createdAt: now,
+        updatedAt: now,
+      );
 
-    await _db.insert('cashier_shifts', shift.toMap());
-    await _enqueueShift(shift, 'create');
-    return shift;
+      await txn.insert('cashier_shifts', shift.toMap());
+      await _enqueueShift(shift, 'create', executor: txn);
+      return shift;
+    });
   }
 
   /// Meja yang tagihannya BELUM lunas (termasuk "sebagian terbayar"), DITAMBAH
@@ -57,11 +63,13 @@ class CashierRepository {
   /// Dipakai sebagai syarat tutup kasir: laci tidak boleh ditutup selama masih
   /// ada tagihan berjalan atau item menggantung di titipan, supaya laporan
   /// shift & setoran kas tidak menyisakan pekerjaan.
-  Future<List<String>> unpaidTables() async {
-    final rows = await _db.query(
+  Future<List<String>> unpaidTables({DatabaseExecutor? executor}) async {
+    final db = executor ?? await _db.database;
+    final rows = await db.query(
       'orders',
       columns: ['table_number'],
-      where: "payment_status != 'paid' AND voided_at IS NULL AND is_holding = 0",
+      where:
+          "payment_status != 'paid' AND voided_at IS NULL AND is_holding = 0",
       orderBy: 'created_at ASC',
     );
     final tables = <String>[];
@@ -72,14 +80,15 @@ class CashierRepository {
 
     // Meja Titipan: hanya menghalangi bila BENAR-BENAR masih ada isinya —
     // order titipan yang sudah kosong (semua item ditarik kembali) diabaikan.
-    final holding = await _db.query(
+    final holding = await db.query(
       'orders',
       columns: ['id'],
-      where: "is_holding = 1 AND payment_status != 'paid' AND voided_at IS NULL",
+      where:
+          "is_holding = 1 AND payment_status != 'paid' AND voided_at IS NULL",
       limit: 1,
     );
     if (holding.isNotEmpty) {
-      final items = await _db.query(
+      final items = await db.query(
         'order_items',
         columns: ['id'],
         where: 'order_id = ?',
@@ -126,53 +135,55 @@ class CashierRepository {
     double? closingTransfer,
     String? notes,
   }) async {
-    final now = DateTime.now();
     final db = await _db.database;
+    return db.transaction((txn) async {
+      final now = DateTime.now();
 
-    // Calculate totals from payments during this shift
-    final shift = await _getShiftById(shiftId);
-    if (shift == null) throw Exception('Shift tidak ditemukan');
-    if (!shift.isOpen) throw Exception('Shift sudah ditutup');
+      // Calculate totals from payments during this shift
+      final shift = await _getShiftById(shiftId, executor: txn);
+      if (shift == null) throw Exception('Shift tidak ditemukan');
+      if (!shift.isOpen) throw Exception('Shift sudah ditutup');
 
-    // Syarat tutup kasir: semua tagihan harus selesai dibayar dulu. Dicek di
-    // sini (bukan hanya di layar) supaya berlaku untuk SEMUA jalur — kasir
-    // utama maupun endpoint station.
-    final unpaid = await unpaidTables();
-    if (unpaid.isNotEmpty) {
-      throw Exception('${unpaidBlockMessage(unpaid)} '
-          'Selesaikan dulu sebelum tutup kasir.');
-    }
+      // Syarat tutup kasir: semua tagihan harus selesai dibayar dulu. Dicek di
+      // sini (bukan hanya di layar) supaya berlaku untuk SEMUA jalur — kasir
+      // utama maupun endpoint station.
+      final unpaid = await unpaidTables(executor: txn);
+      if (unpaid.isNotEmpty) {
+        throw Exception('${unpaidBlockMessage(unpaid)} '
+            'Selesaikan dulu sebelum tutup kasir.');
+      }
 
-    final totals = await _calculateShiftTotals(shiftId);
+      final totals = await _calculateShiftTotals(shiftId, executor: txn);
 
-    // Kas laci = hitung fisik (closingCash) bila diberikan; selain itu pakai
-    // ekspektasi teoritis modal awal + tunai + kas masuk − kas keluar.
-    // Formula lama `(closingCash ?? 0) + cash` men-double-count penjualan
-    // tunai bila closingCash sudah termasuk penjualan.
-    final carryOverCash =
-        closingCash ?? await _expectedDrawerCash(shift, totals);
+      // Kas laci = hitung fisik (closingCash) bila diberikan; selain itu pakai
+      // ekspektasi teoritis modal awal + tunai + kas masuk − kas keluar.
+      // Formula lama `(closingCash ?? 0) + cash` men-double-count penjualan
+      // tunai bila closingCash sudah termasuk penjualan.
+      final carryOverCash = closingCash ??
+          await _expectedDrawerCash(shift, totals, executor: txn);
 
-    await db.update(
-      'cashier_shifts',
-      {
-        'closed_at': now.toIso8601String(),
-        'closed_by': closedBy,
-        'closing_cash': closingCash ?? totals['cash'],
-        'closing_card': closingCard ?? totals['card'],
-        'closing_qris': closingQris ?? totals['qris'],
-        'closing_transfer': closingTransfer ?? totals['transfer'],
-        'carry_over_cash': carryOverCash,
-        'status': 'closed',
-        'notes': notes,
-        'updated_at': now.toIso8601String(),
-      },
-      where: 'id = ?',
-      whereArgs: [shiftId],
-    );
+      await txn.update(
+        'cashier_shifts',
+        {
+          'closed_at': now.toIso8601String(),
+          'closed_by': closedBy,
+          'closing_cash': closingCash ?? totals['cash'],
+          'closing_card': closingCard ?? totals['card'],
+          'closing_qris': closingQris ?? totals['qris'],
+          'closing_transfer': closingTransfer ?? totals['transfer'],
+          'carry_over_cash': carryOverCash,
+          'status': 'closed',
+          'notes': notes,
+          'updated_at': now.toIso8601String(),
+        },
+        where: 'id = ?',
+        whereArgs: [shiftId],
+      );
 
-    final closed = (await _getShiftById(shiftId))!;
-    await _enqueueShift(closed, 'update');
-    return closed;
+      final closed = (await _getShiftById(shiftId, executor: txn))!;
+      await _enqueueShift(closed, 'update', executor: txn);
+      return closed;
+    });
   }
 
   // ==================== HANDOVER (TUKAR SHIFT) ====================
@@ -186,58 +197,60 @@ class CashierRepository {
     double? countedCash,
     String? notes,
   }) async {
-    final now = DateTime.now();
     final db = await _db.database;
+    return db.transaction((txn) async {
+      final now = DateTime.now();
 
-    final current = await _getShiftById(currentShiftId);
-    if (current == null) throw Exception('Shift tidak ditemukan');
-    if (!current.isOpen) throw Exception('Shift sudah ditutup');
+      final current = await _getShiftById(currentShiftId, executor: txn);
+      if (current == null) throw Exception('Shift tidak ditemukan');
+      if (!current.isOpen) throw Exception('Shift sudah ditutup');
 
-    final totals = await _calculateShiftTotals(currentShiftId);
-    // Saldo kas fisik yang diserahterimakan ke kasir berikutnya
-    // (hitung fisik bila ada; selain itu modal + tunai + kas masuk − keluar).
-    final carryOverCash =
-        countedCash ?? await _expectedDrawerCash(current, totals);
+      final totals = await _calculateShiftTotals(currentShiftId, executor: txn);
+      // Saldo kas fisik yang diserahterimakan ke kasir berikutnya
+      // (hitung fisik bila ada; selain itu modal + tunai + kas masuk − keluar).
+      final carryOverCash = countedCash ??
+          await _expectedDrawerCash(current, totals, executor: txn);
 
-    // 1. Tutup shift lama, tandai handover_to
-    await db.update(
-      'cashier_shifts',
-      {
-        'closed_at': now.toIso8601String(),
-        'closed_by': current.openedBy,
-        'closing_cash': totals['cash'],
-        'closing_card': totals['card'],
-        'closing_qris': totals['qris'],
-        'closing_transfer': totals['transfer'],
-        'carry_over_cash': carryOverCash,
-        'handover_to': handoverToUserId,
-        'status': 'closed',
-        'notes': notes,
-        'updated_at': now.toIso8601String(),
-      },
-      where: 'id = ?',
-      whereArgs: [currentShiftId],
-    );
+      // 1. Tutup shift lama, tandai handover_to
+      await txn.update(
+        'cashier_shifts',
+        {
+          'closed_at': now.toIso8601String(),
+          'closed_by': current.openedBy,
+          'closing_cash': totals['cash'],
+          'closing_card': totals['card'],
+          'closing_qris': totals['qris'],
+          'closing_transfer': totals['transfer'],
+          'carry_over_cash': carryOverCash,
+          'handover_to': handoverToUserId,
+          'status': 'closed',
+          'notes': notes,
+          'updated_at': now.toIso8601String(),
+        },
+        where: 'id = ?',
+        whereArgs: [currentShiftId],
+      );
 
-    // 2. Buka shift baru dengan modal = carry over, link ke shift sebelumnya
-    final newShift = CashierShift(
-      id: Ulid.generate(),
-      openedBy: handoverToUserId,
-      openedAt: now,
-      openingCash: carryOverCash,
-      previousShiftId: currentShiftId,
-      status: 'open',
-      createdAt: now,
-      updatedAt: now,
-    );
-    await db.insert('cashier_shifts', newShift.toMap());
+      // 2. Buka shift baru dengan modal = carry over, link ke shift sebelumnya
+      final newShift = CashierShift(
+        id: Ulid.generate(),
+        openedBy: handoverToUserId,
+        openedAt: now,
+        openingCash: carryOverCash,
+        previousShiftId: currentShiftId,
+        status: 'open',
+        createdAt: now,
+        updatedAt: now,
+      );
+      await txn.insert('cashier_shifts', newShift.toMap());
 
-    // 3. Outbox: kirim shift lama (closed) & shift baru (open) ke cloud
-    final closedOld = (await _getShiftById(currentShiftId))!;
-    await _enqueueShift(closedOld, 'update');
-    await _enqueueShift(newShift, 'create');
+      // 3. Outbox: kirim shift lama (closed) & shift baru (open) ke cloud
+      final closedOld = (await _getShiftById(currentShiftId, executor: txn))!;
+      await _enqueueShift(closedOld, 'update', executor: txn);
+      await _enqueueShift(newShift, 'create', executor: txn);
 
-    return newShift;
+      return newShift;
+    });
   }
 
   // ==================== CASH MOVEMENTS ====================
@@ -260,22 +273,52 @@ class CashierRepository {
       createdAt: now,
     );
 
-    await _db.insert('cashier_cash_movements', movement.toMap());
-    await _sync.enqueue(
+    final db = await _db.database;
+    await db.transaction((txn) async {
+      await txn.insert('cashier_cash_movements', movement.toMap());
+      await _enqueueCashMovement(movement, executor: txn);
+    });
+    return movement;
+  }
+
+  Future<void> _enqueueCashMovement(CashMovement movement,
+      {DatabaseExecutor? executor}) {
+    return _sync.enqueue(
       entityType: 'cashier_cash_movement',
       entityId: movement.id,
       operation: 'create',
       payload: {
         'local_id': movement.id,
         'shift_id': movement.shiftId,
-        'movement_type': movement.movementType, // 'in' (penerimaan) | 'out' (pengeluaran)
+        'movement_type':
+            movement.movementType, // 'in' (penerimaan) | 'out' (pengeluaran)
         'amount': movement.amount,
         'counterpart_name': movement.counterpartName,
         'note': movement.note,
         'created_at': _isoUtc(movement.createdAt),
       },
+      executor: executor,
     );
-    return movement;
+  }
+
+  /// Recover movements written by older versions before their outbox insert.
+  /// The original ID and timestamp make a replay safe if cloud already has it.
+  Future<int> enqueueUnsyncedCashMovements() async {
+    final db = await _db.database;
+    return db.transaction((txn) async {
+      final rows = await txn.rawQuery('''
+        SELECT m.* FROM cashier_cash_movements m
+        WHERE NOT EXISTS (
+          SELECT 1 FROM sync_queue q
+          WHERE q.entity_type='cashier_cash_movement' AND q.entity_id=m.id
+        )
+        ORDER BY m.created_at, m.id
+      ''');
+      for (final row in rows) {
+        await _enqueueCashMovement(CashMovement.fromMap(row), executor: txn);
+      }
+      return rows.length;
+    });
   }
 
   Future<List<CashMovement>> getShiftMovements(String shiftId) async {
@@ -290,8 +333,10 @@ class CashierRepository {
 
   // ==================== HELPERS ====================
 
-  Future<CashierShift?> _getShiftById(String id) async {
-    final results = await _db.query(
+  Future<CashierShift?> _getShiftById(String id,
+      {DatabaseExecutor? executor}) async {
+    final db = executor ?? await _db.database;
+    final results = await db.query(
       'cashier_shifts',
       where: 'id = ?',
       whereArgs: [id],
@@ -305,10 +350,11 @@ class CashierRepository {
 
   /// Laporan shift lengkap untuk struk & sync cloud:
   /// per metode bayar (jumlah transaksi + total), kas masuk/keluar, ekspektasi kas.
-  Future<Map<String, dynamic>> getShiftReport(String shiftId) async {
-    final shift = await _getShiftById(shiftId);
+  Future<Map<String, dynamic>> getShiftReport(String shiftId,
+      {DatabaseExecutor? executor}) async {
+    final db = executor ?? await _db.database;
+    final shift = await _getShiftById(shiftId, executor: db);
     if (shift == null) return {};
-    final db = await _db.database;
 
     // Jendela shift [opened_at, closed_at). Tanpa batas atas, cetak ulang
     // laporan shift LAMA ikut menghitung pembayaran shift berikutnya.
@@ -501,8 +547,9 @@ class CashierRepository {
   /// Tulis shift ke outbox cloud dengan breakdown lengkap (jumlah transaksi
   /// per metode + kas masuk/keluar). Field terstruktur (closing_*) tetap
   /// dikirim agar cloud bisa simpan; `report` membawa rincian count.
-  Future<void> _enqueueShift(CashierShift shift, String operation) async {
-    final report = await getShiftReport(shift.id);
+  Future<void> _enqueueShift(CashierShift shift, String operation,
+      {DatabaseExecutor? executor}) async {
+    final report = await getShiftReport(shift.id, executor: executor);
     await _sync.enqueue(
       entityType: 'cashier_shift',
       entityId: shift.id,
@@ -526,6 +573,7 @@ class CashierRepository {
         // Rincian lengkap (jumlah transaksi per metode + kas masuk/keluar)
         'report': report,
       },
+      executor: executor,
     );
   }
 
@@ -585,8 +633,9 @@ class CashierRepository {
   /// modal awal + penjualan tunai + kas masuk − kas keluar.
   /// Selaras dengan `expected_cash` di getShiftReport.
   Future<double> _expectedDrawerCash(
-      CashierShift shift, Map<String, double> totals) async {
-    final db = await _db.database;
+      CashierShift shift, Map<String, double> totals,
+      {DatabaseExecutor? executor}) async {
+    final db = executor ?? await _db.database;
     final rows = await db.rawQuery(
       '''
       SELECT movement_type, COALESCE(SUM(amount), 0) AS total
@@ -605,12 +654,12 @@ class CashierRepository {
     return shift.openingCash + (totals['cash'] ?? 0) + cashIn - cashOut;
   }
 
-  Future<Map<String, double>> _calculateShiftTotals(String shiftId) async {
+  Future<Map<String, double>> _calculateShiftTotals(String shiftId,
+      {DatabaseExecutor? executor}) async {
+    final db = executor ?? await _db.database;
     // Get shift to know when it was opened
-    final shift = await _getShiftById(shiftId);
+    final shift = await _getShiftById(shiftId, executor: db);
     if (shift == null) return {};
-
-    final db = await _db.database;
     // Jendela [opened_at, closed_at) — tanpa batas atas, menghitung ulang
     // total shift LAMA akan menyerap pembayaran shift berikutnya.
     final results = await db.rawQuery(

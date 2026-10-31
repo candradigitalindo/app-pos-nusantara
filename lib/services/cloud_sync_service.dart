@@ -4,13 +4,13 @@ import 'dart:convert';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:sqflite/sqflite.dart';
 
 import '../database/database.dart';
 import '../repositories/order_repository.dart';
+import '../repositories/cashier_repository.dart';
 import '../repositories/sync_queue_repository.dart';
-import '../utils/ulid.dart';
 import 'device_heartbeat_service.dart';
+import 'cloud_restore_writer.dart';
 import 'online_order_service.dart';
 import 'sync_acknowledgements.dart';
 import 'outlet_service.dart';
@@ -32,6 +32,7 @@ class CloudSyncService {
   ));
 
   static const _lastSyncKey = 'cloud_last_pull_at';
+  Future<void>? _masterPull;
   static const _lastSyncAtKey = 'cloud_last_sync_at';
 
   Timer? _timer;
@@ -135,6 +136,7 @@ class CloudSyncService {
     // Tanpa ini order tsb selamanya tampil belum lunas di cloud — backfill
     // order aktif di atas sengaja melewati order 'paid'.
     await _orderRepo.enqueueUnsyncedPaidTransactions();
+    await CashierRepository().enqueueUnsyncedCashMovements();
 
     // Daftar biaya tambahan (pajak, service charge) dikirim ulang tiap siklus.
     // Cloud memakainya untuk menghitung total pesanan online persis seperti
@@ -176,8 +178,7 @@ class CloudSyncService {
         lastSyncAt: await lastSyncAt(),
       );
       final baseUrl = _normalizeBaseUrl(outlet.cloudApiUrl);
-      final url =
-          '$baseUrl/api/v1/outlets/${outlet.cloudOutletId}/heartbeat';
+      final url = '$baseUrl/api/v1/outlets/${outlet.cloudOutletId}/heartbeat';
       await _dio.post(
         url,
         data: payload,
@@ -227,8 +228,7 @@ class CloudSyncService {
       }).toList();
 
       final baseUrl = _normalizeBaseUrl(outlet.cloudApiUrl);
-      final url =
-          '$baseUrl/api/v1/outlets/${outlet.cloudOutletId}/sync/batch';
+      final url = '$baseUrl/api/v1/outlets/${outlet.cloudOutletId}/sync/batch';
 
       final body = {
         'outlet_id': outlet.cloudOutletId,
@@ -297,8 +297,10 @@ class CloudSyncService {
           } else {
             // status "failed" atau tak dikonfirmasi cloud → tetap di outbox.
             await _queue.markFailed(
-                id, 'Belum dikonfirmasi cloud (results status ≠ success)',
-                retry, maxRetries);
+                id,
+                'Belum dikonfirmasi cloud (results status ≠ success)',
+                retry,
+                maxRetries);
             failed++;
           }
         }
@@ -329,193 +331,237 @@ class CloudSyncService {
 
   /// Tarik perubahan produk & kategori dari cloud sejak sync terakhir.
   /// Cloud = sumber kebenaran master data (cloud_wins).
-  Future<void> pullUpdates() async {
-    final outlet = await _outletService.loadOutlet();
-    if (!_isConfigured(outlet) || outlet.cloudOutletId.isEmpty) return;
+  String _pullCheckpointKey(OutletInfo outlet) =>
+      '$_lastSyncKey:${_normalizeBaseUrl(outlet.cloudApiUrl)}:${outlet.cloudOutletId}';
 
-    final prefs = await SharedPreferences.getInstance();
-    final since = prefs.getString(_lastSyncKey) ??
-        DateTime.now()
-            .toUtc()
-            .subtract(const Duration(days: 30))
-            .toIso8601String();
-
-    final baseUrl = _normalizeBaseUrl(outlet.cloudApiUrl);
-    final url = '$baseUrl/api/v1/outlets/${outlet.cloudOutletId}/updates';
-
+  Future<T> _serializeMasterPull<T>(Future<T> Function() action) async {
+    final previous = _masterPull;
+    final done = Completer<void>();
+    _masterPull = done.future;
     try {
-      final resp = await _dio.get(
-        url,
-        queryParameters: {'since': since},
-        options: Options(headers: _authHeaders(outlet)),
-      );
+      if (previous != null) await previous;
+      return await action();
+    } finally {
+      done.complete();
+      if (identical(_masterPull, done.future)) _masterPull = null;
+    }
+  }
 
-      final data = resp.data is Map ? resp.data['data'] : null;
-      if (data is! Map) return;
+  // Missing or malformed collections are errors, not authoritative empty lists.
+  List<Map> _masterRows(dynamic value) {
+    if (value is String) value = jsonDecode(value);
+    if (value is! List || value.any((row) => row is! Map)) {
+      throw const FormatException('Daftar master cloud tidak lengkap');
+    }
+    return value.cast<Map>();
+  }
 
-      final categories = _asList(data['categories']);
-      final products = _asList(data['products']);
-      final deleted = _asList(data['deleted']);
+  String _masterIdentity(Map row) {
+    for (final key in ['local_id', 'cloud_id', 'id']) {
+      final value = row[key];
+      if (value is String && value.trim().isNotEmpty) return value.trim();
+    }
+    throw const FormatException('Identitas master cloud tidak tersedia');
+  }
 
-      final db = await _db.database;
-      // Kategori dulu (produk punya FK ke kategori)
-      for (final c in categories) {
-        if (c is Map) await _applyCategory(db, c);
+  void _validateMaster(Map row, {required bool product}) {
+    _masterIdentity(row);
+    if (row['name'] is! String || (row['name'] as String).trim().isEmpty) {
+      throw const FormatException('Nama master cloud tidak tersedia');
+    }
+    if (product) {
+      final price = row['price'];
+      if (price is! num || !price.isFinite || price < 0) {
+        throw const FormatException('Harga produk cloud tidak valid');
       }
-      for (final p in products) {
-        if (p is Map) await _applyProduct(db, p);
-      }
-      for (final d in deleted) {
-        if (d is Map) await _applyDeletion(db, d);
-      }
+    }
+  }
 
-      final checkpoint = data['sync_checkpoint'] as String?;
-      await prefs.setString(
-        _lastSyncKey,
-        checkpoint ?? DateTime.now().toUtc().toIso8601String(),
-      );
+  Future<void> pullUpdates() async {
+    try {
+      await _serializeMasterPull(() async {
+        final outlet = await _outletService.loadOutlet();
+        if (!_isConfigured(outlet)) return;
+        final prefs = await SharedPreferences.getInstance();
+        final key = _pullCheckpointKey(outlet);
+        // A cursor from another outlet, or an old device-clock cursor, must
+        // never skip this outlet's catalog. Replay once on migration.
+        final since = prefs.getString(key) ?? '1970-01-01T00:00:00.000Z';
+        final baseUrl = _normalizeBaseUrl(outlet.cloudApiUrl);
+        final resp = await _dio.get(
+          '$baseUrl/api/v1/outlets/${outlet.cloudOutletId}/updates',
+          queryParameters: {'since': since},
+          options: Options(headers: _authHeaders(outlet)),
+        );
+        final root = resp.data;
+        final data = root is Map ? root['data'] : null;
+        if (root is! Map || root['success'] == false || data is! Map) {
+          throw const FormatException('Respons master cloud tidak valid');
+        }
+        final categories = _masterRows(data['categories']);
+        final products = _masterRows(data['products']);
+        final deleted = _masterRows(data['deleted']);
+        for (final row in categories) {
+          _validateMaster(row, product: false);
+        }
+        for (final row in products) {
+          _validateMaster(row, product: true);
+        }
+        for (final row in deleted) {
+          _masterIdentity(row);
+          if (!['category', 'product'].contains(row['entity_type'])) {
+            throw const FormatException(
+                'Jenis penghapusan master tidak dikenal');
+          }
+        }
+        final checkpoint = data['sync_checkpoint'];
+        if (checkpoint is! String || DateTime.tryParse(checkpoint) == null) {
+          throw const FormatException('Checkpoint cloud tidak valid');
+        }
+        final db = await _db.database;
+        await db.transaction((txn) async {
+          for (final row in categories) {
+            await _applyCategory(txn, row);
+          }
+          for (final row in products) {
+            await _applyProduct(txn, row);
+          }
+          for (final row in deleted) {
+            await _applyDeletion(txn, row);
+          }
+        });
+        // Saving only after commit makes a crash replay safe. Never substitute
+        // a tablet timestamp for the server's cursor.
+        await prefs.setString(key, checkpoint);
+      });
     } on DioException catch (e) {
       final status = e.response?.statusCode;
       final body = e.response?.data?.toString() ?? '';
       if (status == 403 && body.contains('does not match')) {
-        // Outlet ID tidak cocok dengan API Key → hapus dan discover ulang
-        final prefs2 = await SharedPreferences.getInstance();
-        await prefs2.remove('outlet_cloud_outlet_id');
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.remove('outlet_cloud_outlet_id');
+        // The pull lock has been released before discovery starts a full pull.
         await testConnection();
       } else {
         debugPrint('pullUpdates error: ${_errMessage(e)}');
       }
+    } on FormatException catch (e) {
+      debugPrint('pullUpdates: $e');
     }
   }
 
-  /// Tarik SEMUA kategori & produk dari cloud (bukan incremental).
-  /// Dipakai saat pertama kali terhubung agar seluruh master data masuk,
-  /// termasuk yang dibuat sebelum jendela `since` pada pullUpdates.
-  /// Mengembalikan jumlah {categories, products} yang diproses.
-  Future<Map<String, int>> fullPullFromCloud() async {
-    final outlet = await _outletService.loadOutlet();
-    if (!_isConfigured(outlet) || outlet.cloudOutletId.isEmpty) {
-      return {'categories': 0, 'products': 0};
-    }
-
-    final baseUrl = _normalizeBaseUrl(outlet.cloudApiUrl);
-    final db = await _db.database;
-    var catCount = 0;
-    var prodCount = 0;
-    final cloudCatIds = <String>{};
-    final cloudProdIds = <String>{};
-    var fetchOk = false;
-    int? cloudTotal; // total produk menurut cloud (bila dikirim)
-
-    try {
-      // 1. Semua kategori (kategori dulu karena produk punya FK)
-      final catResp = await _dio.get(
-        '$baseUrl/api/v1/outlets/${outlet.cloudOutletId}/categories',
-        options: Options(headers: _authHeaders(outlet)),
-      );
-      final cats = catResp.data is Map ? catResp.data['data'] : null;
-      if (cats is List) {
-        for (final c in cats) {
-          if (c is Map) {
-            _collectCloudIds(c, cloudCatIds);
-            await _applyCategory(db, c);
-            catCount++;
+  /// Fetch and validate the complete catalog before changing local rows.
+  /// Interrupted or overlapping pages must not remove menu items or move the
+  /// incremental cursor past unseen changes.
+  Future<Map<String, int>> fullPullFromCloud() =>
+      _serializeMasterPull(() async {
+        final outlet = await _outletService.loadOutlet();
+        if (!_isConfigured(outlet)) return {'categories': 0, 'products': 0};
+        final baseUrl = _normalizeBaseUrl(outlet.cloudApiUrl);
+        try {
+          final catResp = await _dio.get(
+            '$baseUrl/api/v1/outlets/${outlet.cloudOutletId}/categories',
+            options: Options(headers: _authHeaders(outlet)),
+          );
+          if (catResp.data is! Map || catResp.data['success'] == false) {
+            throw const FormatException('Respons kategori cloud tidak valid');
           }
-        }
-      }
-
-      // 2. Semua produk (paginasi). PENTING: server bisa membatasi ukuran
-      // halaman (mis. cap 100 walau diminta 200). Jangan berhenti hanya karena
-      // halaman "kurang penuh" — dulu itu membuat produk ke-101+ tak terambil
-      // lalu ikut ter-soft-delete di langkah replace. Andalkan total bila ada;
-      // selain itu teruskan sampai halaman kosong.
-      var page = 1;
-      const limit = 200;
-      String? prevFirstId;
-      while (true) {
-        final prodResp = await _dio.get(
-          '$baseUrl/api/v1/outlets/${outlet.cloudOutletId}/products',
-          queryParameters: {'page': page, 'limit': limit},
-          options: Options(headers: _authHeaders(outlet)),
-        );
-        final body = prodResp.data is Map ? prodResp.data : null;
-        final prods = body?['data'];
-        if (prods is! List || prods.isEmpty) break;
-
-        // Pengaman: server mengabaikan parameter page (mengirim halaman sama
-        // terus) → berhenti agar tidak loop tanpa akhir.
-        final first = prods.first;
-        final firstId = first is Map
-            ? '${first['local_id'] ?? first['cloud_id'] ?? first['id']}'
-            : null;
-        if (firstId != null && firstId == prevFirstId) break;
-        prevFirstId = firstId;
-
-        for (final p in prods) {
-          if (p is Map) {
-            _collectCloudIds(p, cloudProdIds);
-            await _applyProduct(db, p);
-            prodCount++;
+          final categories = _masterRows(catResp.data['data']);
+          final categoryIds = <String>{};
+          for (final row in categories) {
+            _validateMaster(row, product: false);
+            if (!categoryIds.add(_masterIdentity(row))) {
+              throw const FormatException('Kategori cloud terduplikasi');
+            }
           }
+          final products = <Map>[];
+          final productIds = <String>{};
+          int? total;
+          var complete = false;
+          for (var page = 1; page <= 500; page++) {
+            final response = await _dio.get(
+              '$baseUrl/api/v1/outlets/${outlet.cloudOutletId}/products',
+              queryParameters: {'page': page, 'limit': 200},
+              options: Options(headers: _authHeaders(outlet)),
+            );
+            final body = response.data;
+            if (body is! Map || body['success'] == false) {
+              throw const FormatException('Respons produk cloud tidak valid');
+            }
+            final rows = _masterRows(body['data']);
+            final declared = body['total'];
+            if (declared != null) {
+              if (declared is! int ||
+                  declared < 0 ||
+                  (total != null && total != declared)) {
+                throw const FormatException(
+                    'Jumlah produk cloud berubah/tidak valid');
+              }
+              total = declared;
+            }
+            for (final row in rows) {
+              _validateMaster(row, product: true);
+              if (!productIds.add(_masterIdentity(row))) {
+                throw const FormatException('Halaman produk cloud berulang');
+              }
+              products.add(row);
+            }
+            if (total != null && products.length > total) {
+              throw const FormatException(
+                  'Jumlah produk melebihi respons cloud');
+            }
+            if (rows.isEmpty || (total != null && products.length == total)) {
+              complete = total == null || products.length == total;
+              break;
+            }
+          }
+          if (!complete) {
+            throw const FormatException('Daftar produk cloud terpotong');
+          }
+
+          final db = await _db.database;
+          var deletedCategories = 0, deletedProducts = 0;
+          await db.transaction((txn) async {
+            for (final row in categories) {
+              await _applyCategory(txn, row);
+            }
+            for (final row in products) {
+              await _applyProduct(txn, row);
+            }
+            // Retain the empty-outlet guard: an accidental empty configuration
+            // must not erase the entire local menu.
+            if (categories.isNotEmpty || products.isNotEmpty) {
+              deletedCategories =
+                  await _softDeleteNotInCloud(txn, 'categories', categoryIds);
+              deletedProducts =
+                  await _softDeleteNotInCloud(txn, 'products', productIds);
+            }
+          });
+          // A full pull spans requests, not one server snapshot. Replaying updates
+          // from the beginning catches edits committed while pages were fetched,
+          // even when the tablet clock is ahead of the server.
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.setString(
+              _pullCheckpointKey(outlet), '1970-01-01T00:00:00.000Z');
+          return {
+            'categories': categories.length,
+            'products': products.length,
+            'deleted_categories': deletedCategories,
+            'deleted_products': deletedProducts
+          };
+        } on DioException catch (e) {
+          debugPrint('fullPullFromCloud: ${_errMessage(e)}');
+        } on FormatException catch (e) {
+          debugPrint('fullPullFromCloud: $e');
         }
-
-        cloudTotal = (body?['total'] as num?)?.toInt() ?? cloudTotal;
-        if (cloudTotal != null && prodCount >= cloudTotal) break;
-        if (page >= 500) break; // pengaman loop (500 hal × 200 = 100rb produk)
-        page++;
-      }
-
-      fetchOk = true;
-
-      // 3. Update checkpoint agar pull incremental berikutnya tidak ambil ulang semua
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(
-        _lastSyncKey,
-        DateTime.now().toUtc().toIso8601String(),
-      );
-    } on DioException catch (e) {
-      debugPrint('fullPullFromCloud error: ${_errMessage(e)}');
-    }
-
-    // 4. Replace: soft-delete data lokal yang TIDAK ada di cloud (cloud = sumber kebenaran).
-    // Pengaman:
-    //  - Hanya bila fetch sukses (jangan hapus saat jaringan gagal).
-    //  - Hanya bila cloud benar-benar mengirim data. Bila cloud balas 0 produk &
-    //    0 kategori (kemungkinan salah konfigurasi/outlet kosong), JANGAN wipe
-    //    seluruh menu lokal — lebih aman membiarkan data lokal apa adanya.
-    //  - Produk: hanya bila daftar dari cloud LENGKAP (prodCount >= total).
-    //    Daftar terpotong (server cap/paging aneh) pernah membuat produk
-    //    ke-101+ ikut ter-soft-delete di sini.
-    final prodListComplete = cloudTotal == null || prodCount >= cloudTotal;
-    var delCat = 0;
-    var delProd = 0;
-    if (fetchOk && (catCount > 0 || prodCount > 0)) {
-      delCat = await _softDeleteNotInCloud(db, 'categories', cloudCatIds);
-      if (prodListComplete) {
-        delProd = await _softDeleteNotInCloud(db, 'products', cloudProdIds);
-      } else {
-        debugPrint('fullPullFromCloud: daftar produk cloud tidak lengkap '
-            '($prodCount/$cloudTotal) — lewati soft-delete produk lokal.');
-      }
-    }
-
-    debugPrint('fullPullFromCloud: $catCount kategori, $prodCount produk '
-        '(hapus lokal: $delCat kategori, $delProd produk)');
-    return {
-      'categories': catCount,
-      'products': prodCount,
-      'deleted_categories': delCat,
-      'deleted_products': delProd,
-    };
-  }
-
-  /// Kumpulkan id & local_id dari payload cloud ke dalam set.
-  void _collectCloudIds(Map item, Set<String> out) {
-    for (final key in ['id', 'local_id', 'cloud_id']) {
-      final v = item[key];
-      if (v is String && v.isNotEmpty) out.add(v);
-    }
-  }
+        return {
+          'categories': 0,
+          'products': 0,
+          'deleted_categories': 0,
+          'deleted_products': 0,
+          'incomplete': 1
+        };
+      });
 
   // ── Restore (setelah reset DB / fresh install) ───────────────────────────────
 
@@ -539,39 +585,56 @@ class CloudSyncService {
         url,
         options: Options(headers: _authHeaders(outlet)),
       );
-      final root = resp.data is Map ? resp.data as Map : const {};
-      final data = (root['data'] is Map ? root['data'] : root) as Map;
+      if (resp.data is! Map) {
+        throw const FormatException('Respons pemulihan tidak valid');
+      }
+      final root = resp.data as Map;
+      if (root['success'] == false ||
+          (root.containsKey('data') && root['data'] is! Map)) {
+        throw const FormatException('Respons pemulihan tidak valid');
+      }
+      final data = (root['data'] ?? root) as Map;
 
       final db = await _db.database;
-      var shifts = 0, orders = 0, movements = 0;
+      var shifts = 0, orders = 0, movements = 0, skipped = 0;
 
       await db.transaction((txn) async {
-        // 1. Shift terbuka
-        for (final s in _asList(data['open_shifts'])) {
-          if (s is Map) {
-            await _restoreShift(txn, s);
+        final restore = CloudRestoreWriter(txn);
+        final cloudShifts = restore.records(data['open_shifts'], 'shift');
+        final cloudOrders = restore.records(data['unpaid_orders'], 'order');
+        final cloudMovements = restore.records(data['cash_movements'], 'kas');
+        await restore.prepareCharges(data['additional_charges']);
+        for (final shift in cloudShifts) {
+          if (await restore.shift(shift)) {
             shifts++;
+          } else {
+            skipped++;
           }
         }
-        // 2. Order belum dibayar (+ item)
-        for (final o in _asList(data['unpaid_orders'])) {
-          if (o is Map) {
-            await _restoreUnpaidOrder(txn, o);
+        for (final order in cloudOrders) {
+          if (await restore.order(order)) {
             orders++;
+          } else {
+            skipped++;
           }
         }
-        // 3. Pergerakan kas
-        for (final m in _asList(data['cash_movements'])) {
-          if (m is Map) {
-            await _restoreCashMovement(txn, m);
+        for (final movement in cloudMovements) {
+          if (await restore.movement(movement)) {
             movements++;
+          } else {
+            skipped++;
           }
         }
       });
 
       debugPrint('restoreFromCloud: $shifts shift, $orders order, '
           '$movements kas');
-      return {'shifts': shifts, 'orders': orders, 'movements': movements};
+      return {
+        'shifts': shifts,
+        'orders': orders,
+        'movements': movements,
+        if (skipped > 0) 'skipped_existing': skipped,
+      };
     } on DioException catch (e) {
       debugPrint('restoreFromCloud error: ${_errMessage(e)}');
       return {
@@ -580,167 +643,26 @@ class CloudSyncService {
         'movements': 0,
         'error': _errMessage(e),
       };
+    } catch (e) {
+      // The SQLite transaction has rolled back every inserted entity.
+      return {
+        'shifts': 0,
+        'orders': 0,
+        'movements': 0,
+        'error': e is FormatException
+            ? e.message
+            : 'Data pemulihan bertabrakan dengan data lokal. '
+                'Periksa data dan sinkronisasi sebelum mencoba kembali.',
+      };
     }
-  }
-
-  /// Konversi timestamp cloud (UTC, akhiran Z) ke ISO waktu LOKAL tanpa zona —
-  /// konsisten dengan seluruh timestamp lokal (created_at pembayaran dll).
-  /// Tanpa ini, batas shift/laporan bergeser sebesar offset zona (mis. +7 WIB)
-  /// karena perbandingan string mencampur dua zona.
-  String _toLocalIso(String raw, String fallback) {
-    final t = DateTime.tryParse(raw);
-    if (t == null) return fallback;
-    return t.toLocal().toIso8601String();
-  }
-
-  Future<void> _restoreShift(dynamic txn, Map s) async {
-    final id = _pick(s, ['local_id', 'id']);
-    if (id.isEmpty) return;
-    final now = DateTime.now().toIso8601String();
-    await txn.insert(
-      'cashier_shifts',
-      {
-        'id': id,
-        'opened_by': _pick(s, ['opened_by', 'opened_by_name'], 'Kasir'),
-        'opened_at': _toLocalIso(_pick(s, ['opened_at'], now), now),
-        'opening_cash': _numOf(s, ['opening_cash']),
-        'status': 'open',
-        'created_at': now,
-        'updated_at': now,
-      },
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
-  }
-
-  Future<void> _restoreUnpaidOrder(dynamic txn, Map o) async {
-    final id = _pick(o, ['local_id', 'id']);
-    if (id.isEmpty) return;
-    final items = _asList(o['items']);
-    final pay = o['payment_info'] is Map ? o['payment_info'] as Map : const {};
-    final now = DateTime.now().toIso8601String();
-
-    await txn.insert(
-      'orders',
-      {
-        'id': id,
-        'table_number': _pick(o, ['table_number'], '-'),
-        'customer_name': _pickOrNull(o, ['customer_name']),
-        'pax': _intOf(o, ['pax'], 1).clamp(1, 99999),
-        'basket_size': items.length,
-        'total_amount': _numOf(o, ['total_amount']),
-        'paid_amount': _numOf(pay, ['paid_amount']),
-        'order_status':
-            _oneOf(_pick(o, ['order_status', 'status']), const ['cooking', 'ready', 'served'], 'cooking'),
-        'payment_status': _oneOf(_pick(pay, ['payment_status']),
-            const ['unpaid', 'partial', 'paid'], 'unpaid'),
-        'created_at': _toLocalIso(_pick(o, ['created_at'], now), now),
-        'updated_at': now,
-      },
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
-
-    await txn.delete('order_items', where: 'order_id = ?', whereArgs: [id]);
-    for (final it in items) {
-      if (it is! Map) continue;
-      await txn.insert('order_items', {
-        'id': Ulid.generate(),
-        'order_id': id,
-        'product_id': _pickOrNull(it, ['product_id']),
-        'product_name': _pick(it, ['product_name', 'name'], '-'),
-        'qty': _intOf(it, ['qty', 'quantity'], 1).clamp(1, 99999),
-        'price': _numOf(it, ['price']),
-        'destination':
-            _oneOf(_pick(it, ['destination']), const ['kitchen', 'bar'], 'kitchen'),
-        'item_status': _oneOf(_pick(it, ['status', 'item_status']),
-            const ['pending', 'cooking', 'ready', 'served'], 'pending'),
-        'notes': _pick(it, ['notes']),
-        'created_at': now,
-        'updated_at': now,
-      });
-    }
-  }
-
-  Future<void> _restoreCashMovement(dynamic txn, Map m) async {
-    final id = _pick(m, ['local_id', 'id']);
-    if (id.isEmpty) return;
-    final now = DateTime.now().toIso8601String();
-    await txn.insert(
-      'cashier_cash_movements',
-      {
-        'id': id,
-        'shift_id': _pick(m, ['shift_id']),
-        'movement_type':
-            _oneOf(_pick(m, ['movement_type', 'type']), const ['in', 'out'], 'in'),
-        'amount': _numOf(m, ['amount']),
-        'counterpart_name':
-            _pick(m, ['counterpart_name', 'name'], '-'),
-        'note': _pick(m, ['note']),
-        'created_at': _toLocalIso(_pick(m, ['created_at'], now), now),
-      },
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
-  }
-
-  // Helper parsing toleran (cloud bisa pakai beberapa nama field).
-  String _pick(Map m, List<String> keys, [String fallback = '']) {
-    for (final k in keys) {
-      final v = m[k];
-      if (v != null && v.toString().isNotEmpty) return v.toString();
-    }
-    return fallback;
-  }
-
-  String? _pickOrNull(Map m, List<String> keys) {
-    final v = _pick(m, keys);
-    return v.isEmpty ? null : v;
-  }
-
-  double _numOf(Map m, List<String> keys) {
-    for (final k in keys) {
-      final v = m[k];
-      if (v is num) return v.toDouble();
-      if (v is String) {
-        final p = double.tryParse(v);
-        if (p != null) return p;
-      }
-    }
-    return 0;
-  }
-
-  int _intOf(Map m, List<String> keys, int fallback) {
-    for (final k in keys) {
-      final v = m[k];
-      if (v is num) return v.toInt();
-      if (v is String) {
-        final p = int.tryParse(v);
-        if (p != null) return p;
-      }
-    }
-    return fallback;
-  }
-
-  String _oneOf(String value, List<String> allowed, String fallback) =>
-      allowed.contains(value) ? value : fallback;
-
-  /// Ambil List dengan aman. Bila cloud mengirim JSON-string (mis. "[...]"),
-  /// coba decode; selain itu kembalikan list kosong.
-  List _asList(dynamic v) {
-    if (v is List) return v;
-    if (v is String && v.trim().isNotEmpty) {
-      try {
-        final decoded = jsonDecode(v);
-        if (decoded is List) return decoded;
-      } catch (_) {}
-    }
-    return const [];
   }
 
   /// Soft-delete baris aktif di [table] yang id-nya tidak ada di [cloudIds].
   /// Mengembalikan jumlah baris yang dihapus.
   Future<int> _softDeleteNotInCloud(
       dynamic db, String table, Set<String> cloudIds) async {
-    final rows = await db.query(table,
-        columns: ['id'], where: 'is_deleted = 0');
+    final rows =
+        await db.query(table, columns: ['id'], where: 'is_deleted = 0');
     final now = DateTime.now().toIso8601String();
     var deleted = 0;
     for (final r in rows) {
@@ -758,9 +680,9 @@ class CloudSyncService {
   }
 
   Future<void> _applyCategory(dynamic db, Map cat) async {
-    final id = (cat['local_id'] ?? cat['cloud_id'] ?? cat['id']) as String?;
+    final id = _masterIdentity(cat);
     final name = cat['name'] as String?;
-    if (id == null || name == null) return;
+    if (name == null) return;
     final now = DateTime.now().toIso8601String();
     // Buang kategori lokal dengan nama sama tapi id beda (mis. data seed) agar
     // tidak melanggar UNIQUE(name). FK products.category_id ON DELETE SET NULL.
@@ -777,9 +699,9 @@ class CloudSyncService {
   }
 
   Future<void> _applyProduct(dynamic db, Map prod) async {
-    final id = (prod['local_id'] ?? prod['cloud_id'] ?? prod['id']) as String?;
+    final id = _masterIdentity(prod);
     final name = prod['name'] as String?;
-    if (id == null || name == null) return;
+    if (name == null) return;
     final price = (prod['price'] as num?)?.toDouble() ?? 0;
     final stock = (prod['stock'] as num?)?.toInt() ?? 0;
     final code = prod['code'] as String?;
@@ -842,8 +764,7 @@ class CloudSyncService {
 
   Future<void> _applyDeletion(dynamic db, Map del) async {
     final type = del['entity_type'] as String?;
-    final id = (del['local_id'] ?? del['cloud_id']) as String?;
-    if (id == null) return;
+    final id = _masterIdentity(del);
     final table = type == 'category' ? 'categories' : 'products';
     await db.update(
       table,
@@ -946,14 +867,18 @@ class CloudSyncService {
         ),
       );
     } on DioException catch (e) {
-      return {'success': false, 'error': 'Server tidak terjangkau: ${_errMessage(e)}'};
+      return {
+        'success': false,
+        'error': 'Server tidak terjangkau: ${_errMessage(e)}'
+      };
     }
 
     try {
       // Auto-discover outlet via API Key
       final resp = await _dio.get(
         '$baseUrl/api/v1/outlet/me',
-        options: Options(headers: {'Authorization': 'Bearer ${outlet.cloudApiKey}'}),
+        options:
+            Options(headers: {'Authorization': 'Bearer ${outlet.cloudApiKey}'}),
       );
 
       final respData = resp.data is Map ? resp.data : null;
@@ -966,10 +891,10 @@ class CloudSyncService {
         final outletAddress = data['address']?.toString() ?? '';
         // Nomor HP outlet — dukung beberapa nama field yang mungkin dipakai cloud.
         final outletPhone = (data['phone'] ??
-                data['phone_number'] ??
-                data['hp'] ??
-                data['telp'])
-            ?.toString() ??
+                    data['phone_number'] ??
+                    data['hp'] ??
+                    data['telp'])
+                ?.toString() ??
             '';
 
         // Simpan outlet ID ke shared preferences
@@ -986,6 +911,13 @@ class CloudSyncService {
 
         // Tarik semua master data (produk & kategori) dari cloud
         final pulled = await fullPullFromCloud();
+        if (pulled['incomplete'] == 1) {
+          return {
+            'success': false,
+            'error':
+                'Terhubung, tetapi daftar menu belum lengkap. Coba sinkronkan kembali.'
+          };
+        }
 
         return {
           'success': true,
@@ -998,7 +930,10 @@ class CloudSyncService {
         };
       }
 
-      return {'success': false, 'error': 'API Key tidak valid atau outlet tidak ditemukan'};
+      return {
+        'success': false,
+        'error': 'API Key tidak valid atau outlet tidak ditemukan'
+      };
     } on DioException catch (e) {
       final status = e.response?.statusCode;
       if (status == 401 || status == 403) {

@@ -1,5 +1,7 @@
 import 'dart:convert';
 
+import 'package:sqflite/sqflite.dart';
+
 import '../database/database.dart';
 
 /// Outbox untuk sinkronisasi ke cloud-pos. Setiap mutasi penting (shift,
@@ -16,25 +18,38 @@ class SyncQueueRepository {
     required String entityId,
     required String operation, // 'create' | 'update' | 'delete'
     required Map<String, dynamic> payload,
+    DatabaseExecutor? executor,
   }) async {
-    final db = await _db.database;
-    // Hapus pending & failed lama untuk entity yang sama sebelum insert baru.
-    // Ini memungkinkan re-enqueue setelah retry exhausted (status='failed').
-    await db.delete(
-      'sync_queue',
-      where: "entity_type = ? AND entity_id = ? AND status IN ('pending', 'failed')",
-      whereArgs: [entityType, entityId],
-    );
-    await db.insert('sync_queue', {
-      'entity_type': entityType,
-      'entity_id': entityId,
-      'operation': operation,
-      'payload': jsonEncode(payload),
-      'status': 'pending',
-      'retry_count': 0,
-      'max_retries': 3,
-      'created_at': DateTime.now().toIso8601String(),
-    });
+    final encoded = jsonEncode(payload);
+    Future<void> write(DatabaseExecutor target) async {
+      // Replacement and insertion must commit together. A failed insert must
+      // leave the previous pending snapshot available for retry.
+      await target.delete(
+        'sync_queue',
+        where:
+            "entity_type = ? AND entity_id = ? AND status IN ('pending', 'failed')",
+        whereArgs: [entityType, entityId],
+      );
+      await target.insert('sync_queue', {
+        'entity_type': entityType,
+        'entity_id': entityId,
+        'operation': operation,
+        'payload': encoded,
+        'status': 'pending',
+        'retry_count': 0,
+        'max_retries': 3,
+        'created_at': DateTime.now().toIso8601String(),
+      });
+    }
+
+    // A caller persisting business data can pass its active transaction so
+    // the business row and its outbox snapshot are one durable write.
+    if (executor != null) {
+      await write(executor);
+    } else {
+      final db = await _db.database;
+      await db.transaction(write);
+    }
   }
 
   /// Ambil batch pending tertua (FIFO) untuk dikirim.
@@ -62,7 +77,8 @@ class SyncQueueRepository {
     );
   }
 
-  Future<void> markFailed(int id, String error, int retryCount, int maxRetries) async {
+  Future<void> markFailed(
+      int id, String error, int retryCount, int maxRetries) async {
     final db = await _db.database;
     final exhausted = retryCount + 1 >= maxRetries;
     await db.update(
@@ -95,9 +111,10 @@ class SyncQueueRepository {
   /// yang BELUM terkonfirmasi terkirim ke cloud (pending/gagal/tanpa entri).
   ///
   /// Status per transaksi diturunkan dari sync_queue (entity_type='transaction'):
-  ///  - synced  : ada baris status='success'
-  ///  - pending : ada baris status='pending' (belum sukses)
-  ///  - failed  : ada baris status='failed'
+  /// Gunakan job terbaru: keberhasilan lama tidak mengonfirmasi revisi baru.
+  ///  - synced  : job terbaru berstatus 'success'
+  ///  - pending : job terbaru belum terkonfirmasi
+  ///  - failed  : job terbaru berstatus 'failed'
   ///  - missing : tak ada baris sama sekali (dalam jendela retensi = mencurigakan;
   ///              di luar jendela biasanya karena riwayat sukses sudah dipurge —
   ///              maka jendela dibatasi [days] hari agar tak salah tuduh).
@@ -106,24 +123,21 @@ class SyncQueueRepository {
   /// memastikan benar-benar tersimpan di cloud diperlukan rekonsiliasi cloud.
   Future<Map<String, dynamic>> reconciliation({int days = 30}) async {
     final db = await _db.database;
-    final cutoff = DateTime.now()
-        .subtract(Duration(days: days))
-        .toIso8601String();
+    final cutoff =
+        DateTime.now().subtract(Duration(days: days)).toIso8601String();
     final rows = await db.rawQuery(
       '''
       SELECT sync_state, COUNT(*) AS c, COALESCE(SUM(total_amount), 0) AS amt
       FROM (
         SELECT t.total_amount,
-          CASE
-            WHEN EXISTS (SELECT 1 FROM sync_queue q
-                         WHERE q.entity_type='transaction' AND q.entity_id=t.id
-                           AND q.status='success') THEN 'synced'
-            WHEN EXISTS (SELECT 1 FROM sync_queue q
-                         WHERE q.entity_type='transaction' AND q.entity_id=t.id
-                           AND q.status='pending') THEN 'pending'
-            WHEN EXISTS (SELECT 1 FROM sync_queue q
-                         WHERE q.entity_type='transaction' AND q.entity_id=t.id
-                           AND q.status='failed') THEN 'failed'
+          CASE (SELECT q.status FROM sync_queue q
+                WHERE q.entity_type='transaction' AND q.entity_id=t.id
+                ORDER BY q.id DESC LIMIT 1)
+            WHEN 'success' THEN 'synced'
+            WHEN 'failed' THEN 'failed'
+            WHEN 'pending' THEN 'pending'
+            WHEN 'processing' THEN 'pending'
+            WHEN 'bundled' THEN 'pending'
             ELSE 'missing'
           END AS sync_state
         FROM transactions t
@@ -136,10 +150,14 @@ class SyncQueueRepository {
 
     final out = {
       'window_days': days,
-      'synced_count': 0, 'synced_amount': 0.0,
-      'pending_count': 0, 'pending_amount': 0.0,
-      'failed_count': 0, 'failed_amount': 0.0,
-      'missing_count': 0, 'missing_amount': 0.0,
+      'synced_count': 0,
+      'synced_amount': 0.0,
+      'pending_count': 0,
+      'pending_amount': 0.0,
+      'failed_count': 0,
+      'failed_amount': 0.0,
+      'missing_count': 0,
+      'missing_amount': 0.0,
     };
     for (final r in rows) {
       final s = r['sync_state'] as String;
