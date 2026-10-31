@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../models/models.dart';
 import '../../repositories/product_repository.dart';
+import '../../services/cash_drawer_service.dart';
 import '../../services/printer_service.dart';
 import '../../theme/theme.dart';
 import '../../widgets/ui/ui.dart';
@@ -26,6 +27,10 @@ class _PrinterSettingsScreenState extends State<PrinterSettingsScreen>
 
   // Kategori menu (untuk assign per printer)
   List<Category> _categories = [];
+
+  // Laci kasir (cash drawer) — dibuka lewat printer struk.
+  CashDrawerSettings _drawer = const CashDrawerSettings();
+  bool _drawerTesting = false;
 
   // Bluetooth scan
   List<PrinterDevice> _btDevices = [];
@@ -55,11 +60,13 @@ class _PrinterSettingsScreenState extends State<PrinterSettingsScreen>
     final results = await Future.wait([
       _service.getSavedPrinters(),
       _productRepo.getCategories(),
+      CashDrawerService.instance.settings(),
     ]);
     if (mounted) {
       setState(() {
         _saved = results[0] as List<PrinterDevice>;
         _categories = results[1] as List<Category>;
+        _drawer = results[2] as CashDrawerSettings;
       });
     }
   }
@@ -294,6 +301,48 @@ class _PrinterSettingsScreenState extends State<PrinterSettingsScreen>
     }
   }
 
+  // ── Laci kasir (cash drawer) ───────────────────────────────────────────────
+
+  Future<void> _saveDrawer(CashDrawerSettings next) async {
+    await CashDrawerService.instance.save(next);
+    if (mounted) setState(() => _drawer = next);
+  }
+
+  /// Tes buka laci memakai pengaturan yang SEDANG tampil (pin & durasi pulsa),
+  /// supaya kasir bisa mencoba kombinasi sebelum yakin menyimpannya.
+  Future<void> _testDrawer() async {
+    setState(() => _drawerTesting = true);
+    try {
+      await CashDrawerService.instance
+          .open(pin: _drawer.pin, pulseMs: _drawer.pulseMs);
+      if (mounted) showAppSnack(context, 'Perintah buka laci terkirim');
+    } catch (e) {
+      if (mounted) {
+        showAppSnack(context, 'Gagal buka laci: ${e.toString().replaceFirst('Exception: ', '')}',
+            isError: true);
+      }
+    } finally {
+      if (mounted) setState(() => _drawerTesting = false);
+    }
+  }
+
+  /// Nama printer yang akan memicu laci (mengikuti aturan pemilihan di service).
+  String get _drawerPrinterLabel {
+    if (_saved.isEmpty) return 'belum ada printer';
+    if (_drawer.printerAddress.isNotEmpty) {
+      for (final p in _saved) {
+        if (p.address == _drawer.printerAddress) return p.name;
+      }
+    }
+    final cashiers =
+        _saved.where((p) => p.hasRole(PrinterRole.cashier)).toList();
+    if (cashiers.isNotEmpty) return cashiers.first.name;
+    return _saved
+        .firstWhere((p) => !p.hasRole(PrinterRole.checker),
+            orElse: () => _saved.first)
+        .name;
+  }
+
   // ── Build ──────────────────────────────────────────────────────────────────
 
   @override
@@ -345,30 +394,159 @@ class _PrinterSettingsScreenState extends State<PrinterSettingsScreen>
   // ── Tab: Saved ─────────────────────────────────────────────────────────────
 
   Widget _buildSavedTab() {
-    if (_saved.isEmpty) {
-      return const EmptyState(
-        icon: Icons.print_disabled_rounded,
-        title: 'Belum ada printer tersimpan',
-        message: 'Scan Bluetooth atau LAN untuk menambahkan.',
-        accent: _accent,
+    return ListView(
+      padding: const EdgeInsets.all(AppSpacing.md),
+      children: [
+        _buildCashDrawerCard(),
+        const SizedBox(height: AppSpacing.md),
+        if (_saved.isEmpty)
+          const Padding(
+            padding: EdgeInsets.only(top: AppSpacing.lg),
+            child: EmptyState(
+              icon: Icons.print_disabled_rounded,
+              title: 'Belum ada printer tersimpan',
+              message: 'Scan Bluetooth atau LAN untuk menambahkan.',
+              accent: _accent,
+            ),
+          )
+        else
+          for (var i = 0; i < _saved.length; i++)
+            Padding(
+              padding: EdgeInsets.only(
+                  bottom: i == _saved.length - 1 ? 0 : AppSpacing.sm),
+              child: _PrinterTile(
+                device: _saved[i],
+                isSaved: true,
+                onSave: null,
+                onRemove: () => _remove(_saved[i]),
+                onTest: () => _testPrint(_saved[i]),
+                onRoleToggle: (role) => _toggleRole(_saved[i], role),
+                categories: _categories,
+                onCategoryToggle: (catId) => _toggleCategory(_saved[i], catId),
+                onPaperChange: (cols) => _setPaper(_saved[i], cols),
+                onCopiesChange: (n) => _setCopies(_saved[i], n),
+              ),
+            ),
+      ],
+    );
+  }
+
+  /// Kartu pengaturan LACI KASIR. Laci POS menempel di port RJ11 printer struk,
+  /// jadi pengaturannya duduk bersama printer — bukan di layar terpisah.
+  Widget _buildCashDrawerCard() {
+    Widget chip(String label, bool selected, VoidCallback onTap) {
+      return GestureDetector(
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(
+              horizontal: AppSpacing.md, vertical: 6),
+          decoration: BoxDecoration(
+            color: selected ? AppColors.accent : AppColors.surfaceMuted,
+            borderRadius: AppRadius.rXs,
+          ),
+          child: Text(label,
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+                color: selected ? Colors.white : AppColors.textTertiary,
+              )),
+        ),
       );
     }
 
-    return ListView.separated(
-      padding: const EdgeInsets.all(AppSpacing.md),
-      itemCount: _saved.length,
-      separatorBuilder: (_, __) => const SizedBox(height: AppSpacing.sm),
-      itemBuilder: (context, i) => _PrinterTile(
-        device: _saved[i],
-        isSaved: true,
-        onSave: null,
-        onRemove: () => _remove(_saved[i]),
-        onTest: () => _testPrint(_saved[i]),
-        onRoleToggle: (role) => _toggleRole(_saved[i], role),
-        categories: _categories,
-        onCategoryToggle: (catId) => _toggleCategory(_saved[i], catId),
-        onPaperChange: (cols) => _setPaper(_saved[i], cols),
-        onCopiesChange: (n) => _setCopies(_saved[i], n),
+    Widget group(IconData icon, String label, List<Widget> chips) => Wrap(
+          crossAxisAlignment: WrapCrossAlignment.center,
+          spacing: 6,
+          runSpacing: 6,
+          children: [
+            Row(mainAxisSize: MainAxisSize.min, children: [
+              Icon(icon, size: 14, color: AppColors.moduleKasir),
+              const SizedBox(width: 5),
+              Text(label, style: AppType.label),
+            ]),
+            ...chips,
+          ],
+        );
+
+    return AppCard(
+      padding: const EdgeInsets.symmetric(
+          horizontal: AppSpacing.md, vertical: AppSpacing.sm),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const IconBadge(
+                icon: Icons.point_of_sale_rounded,
+                color: AppColors.moduleKasir,
+                size: 44,
+              ),
+              const SizedBox(width: AppSpacing.sm),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Laci Kasir', style: AppType.title),
+                    const SizedBox(height: 2),
+                    Text(
+                      _drawer.enabled
+                          ? 'Terbuka otomatis saat pembayaran lunas'
+                          : 'Otomatis mati — buka lewat tombol "Buka Laci"',
+                      style: AppType.caption,
+                    ),
+                  ],
+                ),
+              ),
+              Switch(
+                value: _drawer.enabled,
+                onChanged: (v) => _saveDrawer(_drawer.copyWith(enabled: v)),
+              ),
+            ],
+          ),
+          const Divider(height: AppSpacing.lg, color: AppColors.border),
+          group(Icons.payments_outlined, 'Buka untuk:', [
+            chip('Tunai saja', _drawer.cashOnly,
+                () => _saveDrawer(_drawer.copyWith(cashOnly: true))),
+            chip('Semua metode', !_drawer.cashOnly,
+                () => _saveDrawer(_drawer.copyWith(cashOnly: false))),
+          ]),
+          const SizedBox(height: AppSpacing.sm),
+          group(Icons.print_rounded, 'Printer laci:', [
+            chip('Ikut printer kasir', _drawer.printerAddress.isEmpty,
+                () => _saveDrawer(_drawer.copyWith(printerAddress: ''))),
+            for (final p in _saved)
+              chip(p.name, _drawer.printerAddress == p.address,
+                  () => _saveDrawer(_drawer.copyWith(printerAddress: p.address))),
+          ]),
+          const SizedBox(height: AppSpacing.sm),
+          group(Icons.cable_rounded, 'Pin konektor:', [
+            chip('Pin 2', _drawer.pin == 2,
+                () => _saveDrawer(_drawer.copyWith(pin: 2))),
+            chip('Pin 5', _drawer.pin == 5,
+                () => _saveDrawer(_drawer.copyWith(pin: 5))),
+          ]),
+          const SizedBox(height: AppSpacing.sm),
+          group(Icons.timer_outlined, 'Durasi pulsa:', [
+            for (final ms in CashDrawerSettings.pulseChoices)
+              chip('$ms ms', _drawer.pulseMs == ms,
+                  () => _saveDrawer(_drawer.copyWith(pulseMs: ms))),
+          ]),
+          const SizedBox(height: AppSpacing.sm),
+          Text(
+            'Laci dibuka lewat printer: $_drawerPrinterLabel. '
+            'Bila laci tidak bereaksi, coba ganti pin (2 ↔ 5) atau perpanjang durasi pulsa.',
+            style: AppType.caption.copyWith(color: AppColors.textTertiary),
+          ),
+          const SizedBox(height: AppSpacing.sm),
+          AppButton(
+            label: 'Tes Buka Laci',
+            icon: Icons.lock_open_rounded,
+            accent: AppColors.accent,
+            size: AppButtonSize.medium,
+            loading: _drawerTesting,
+            onPressed: _drawerTesting || _saved.isEmpty ? null : _testDrawer,
+          ),
+        ],
       ),
     );
   }

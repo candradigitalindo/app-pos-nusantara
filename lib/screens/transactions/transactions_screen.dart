@@ -1,11 +1,17 @@
 import 'package:flutter/material.dart';
 
+import '../../controllers/cashier_controller.dart';
 import '../../controllers/transactions_controller.dart';
+import '../../services/app_events.dart';
 import '../../models/models.dart';
+import '../../services/qris_service.dart';
 import '../../theme/theme.dart';
 import '../../utils/currency.dart';
 import '../../widgets/pin_auth_dialog.dart';
+import '../../widgets/qris_payment_dialog.dart';
 import '../../widgets/ui/ui.dart';
+import '../cashier/cashier_order_actions.dart';
+import '../cashier/cashier_widgets.dart';
 
 class TransactionsScreen extends StatefulWidget {
   const TransactionsScreen({super.key});
@@ -14,9 +20,30 @@ class TransactionsScreen extends StatefulWidget {
   State<TransactionsScreen> createState() => _TransactionsScreenState();
 }
 
-class _TransactionsScreenState extends State<TransactionsScreen> {
+class _TransactionsScreenState extends State<TransactionsScreen>
+    with AppEventsRefresh<TransactionsScreen>,
+        CashierOrderActions<TransactionsScreen> {
   late final TransactionsController _controller;
   final _scrollController = ScrollController();
+
+  /// Controller kasir khusus untuk menjalankan AKSI order (Diskon, Kompliment,
+  /// Split Bill, Gabung Bayar, Pindah/Gabung Meja, Titipan, Cetak Tagihan) dari
+  /// layar ini. Dialognya sama persis dengan layar Kasir karena berasal dari
+  /// mixin [CashierOrderActions]; controller ini hanya perlu "menunjuk" order
+  /// yang dipilih.
+  late final CashierController _actions = CashierController();
+
+  /// Id order yang controller aksinya sudah siap (currentOrder = order itu).
+  String? _actionsOrderId;
+  bool _preparingActions = false;
+
+  @override
+  CashierController get actionsController => _actions;
+
+  /// Pembayaran dari daftar transaksi selalu digerbang PIN — termasuk Split
+  /// Bill & Gabung Bayar — karena dilakukan di luar alur kasir.
+  @override
+  Future<bool> Function()? get paymentGuard => _authorizePaymentAction;
 
   /// Id transaksi terpilih (dipakai tampilan master-detail di tablet).
   String? _selectedId;
@@ -28,6 +55,107 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
     _controller.addListener(_onStateChanged);
     _controller.loadOrders(reset: true);
     _scrollController.addListener(_onScroll);
+    _actions.addListener(_onActionsChanged);
+    listenDataChanges();
+  }
+
+  /// Data berubah dari perangkat/aksi lain → segarkan daftar & order aksi.
+  @override
+  void onDataChanged() {
+    _controller.loadOrders(reset: true);
+    final id = _actionsOrderId;
+    if (id != null) {
+      _actionsOrderId = null;
+      final order = _controller.state.orders
+          .where((o) => o.id == id)
+          .toList();
+      if (order.isNotEmpty) _prepareActions(order.first);
+    }
+  }
+
+  void _onActionsChanged() {
+    if (!mounted) return;
+    setState(() {});
+    final err = _actions.state.errorMessage;
+    if (err != null) {
+      _actions.clearError();
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) showAppSnack(context, err, isError: true);
+      });
+    }
+  }
+
+  /// Siapkan controller aksi untuk [order]: muat data kasir lalu tunjuk meja &
+  /// order-nya, supaya dialog aksi membaca order yang benar.
+  Future<void> _prepareActions(Order order) async {
+    if (_actionsOrderId == order.id || _preparingActions) return;
+    setState(() {
+      _preparingActions = true;
+      _actionsOrderId = null;
+    });
+    try {
+      await _actions.loadData();
+      final tables = _actions.state.tables
+          .where((t) => t.tableNumber == order.tableNumber)
+          .toList();
+      if (tables.isNotEmpty) {
+        _actions.selectTable(tables.first);
+        await _actions.loadOrderForTable(order.tableNumber);
+      }
+      final ready = _actions.state.currentOrder?.id == order.id;
+      if (!mounted) return;
+      setState(() {
+        _preparingActions = false;
+        _actionsOrderId = ready ? order.id : null;
+      });
+    } catch (_) {
+      if (mounted) setState(() => _preparingActions = false);
+    }
+  }
+
+  Future<bool> _authorizePaymentAction() async {
+    final auth = await showPinAuthDialog(
+      context,
+      title: 'Otorisasi Pembayaran',
+      actionLabel: 'Lanjutkan',
+      actionColor: AppColors.success,
+      icon: Icons.payments_rounded,
+      askReason: false,
+      details: {
+        'Meja': _actions.state.currentOrder?.tableNumber ?? '-',
+        'Sisa tagihan':
+            CurrencyHelper.format(_actions.state.currentOrder?.remaining ?? 0),
+      },
+    );
+    if (auth == null || !mounted) return false;
+    final by = await _controller.authorize(auth.pin);
+    if (!mounted) return false;
+    if (by == null) {
+      showAppSnack(context, 'PIN salah / tidak berwenang', isError: true);
+      return false;
+    }
+    return true;
+  }
+
+  /// Panel "Aksi Lainnya" untuk transaksi BELUM dibayar — tombol & urutannya
+  /// sama dengan layar Kasir.
+  Widget _actionsPanel(Order order,
+      {bool expanded = false, VoidCallback? onToggle}) {
+    if (_actionsOrderId != order.id) {
+      if (!_preparingActions) return const SizedBox.shrink();
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: AppSpacing.sm),
+        child: Center(
+          child: SizedBox(
+            width: 18,
+            height: 18,
+            child: CircularProgressIndicator(strokeWidth: 2.4),
+          ),
+        ),
+      );
+    }
+    return buildOrderActionsPanel(_actions.state.isProcessing,
+        expanded: expanded, onToggle: onToggle);
   }
 
   @override
@@ -38,7 +166,10 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
 
   @override
   void dispose() {
+    cancelDataChanges();
     _controller.dispose();
+    _actions.removeListener(_onActionsChanged);
+    _actions.dispose();
     _scrollController.dispose();
     super.dispose();
   }
@@ -70,6 +201,9 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
   }
 
   void _onTapOrder(Order order) {
+    // Aksi selalu tertutup dulu saat berpindah transaksi.
+    if (order.id != _selectedId) resetOrderActions();
+    if (!order.isPaid && !order.isVoided) _prepareActions(order);
     if (context.isTablet) {
       setState(() => _selectedId = order.id);
     } else {
@@ -119,7 +253,7 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
           const SizedBox(height: AppSpacing.lg),
           if (order.isVoided)
             const _VoidNote()
-          else if (!order.isPaid)
+          else if (!order.isPaid) ...[
             AppButton(
               label: 'Bayar',
               icon: Icons.payments_rounded,
@@ -128,7 +262,15 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
                 Navigator.pop(ctx);
                 _showPayDialog(order);
               },
-            )
+            ),
+            const SizedBox(height: AppSpacing.sm),
+            StatefulBuilder(
+              builder: (_, setSheet) => _actionsPanel(
+                order,
+                onToggle: () => setSheet(toggleOrderActions),
+              ),
+            ),
+          ]
           else
             AppButton(
               label: 'Void Transaksi',
@@ -144,119 +286,61 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
     );
   }
 
-  /// Bayar seperti di kasir (metode + jumlah + kembalian), digerbang PIN.
+  /// Bayar dari daftar transaksi memakai dialog pembayaran yang SAMA PERSIS
+  /// dengan layar Kasir ([CashierPaymentSheet]) — metode, jumlah bayar, dan
+  /// kembalian tampil identik, jadi kasir tak perlu belajar dua tampilan.
+  /// Bedanya hanya satu: pembayaran dari sini tetap butuh otorisasi PIN
+  /// Manager/SVP karena dilakukan di luar alur kasir.
   Future<void> _showPayDialog(Order order) async {
-    const methods = {
-      'cash': 'Tunai',
-      'qris': 'QRIS',
-      'card': 'Kartu',
-      'transfer': 'Transfer',
-    };
-    var method = 'cash';
+    final remaining = order.remaining;
     final amountCtrl = TextEditingController(
-        text: CurrencyHelper.formatInput(order.remaining.round()));
-    final pinCtrl = TextEditingController();
-    final ok = await showAppModal<bool>(
-      context,
-      title: 'Bayar — Meja ${order.tableNumber}',
-      subtitle: 'Sisa tagihan ${CurrencyHelper.format(order.remaining)}',
-      icon: Icons.payments_rounded,
-      accent: AppColors.success,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setS) => Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Text('Metode Pembayaran',
-                style: AppType.label.copyWith(color: AppColors.textSecondary)),
-            const SizedBox(height: AppSpacing.xs),
-            Wrap(
-              spacing: AppSpacing.xs,
-              runSpacing: AppSpacing.xs,
-              children: methods.entries.map((e) {
-                final sel = method == e.key;
-                return GestureDetector(
-                  onTap: () => setS(() => method = e.key),
-                  child: AnimatedContainer(
-                    duration: AppMotion.fast,
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: AppSpacing.md, vertical: AppSpacing.xs),
-                    decoration: BoxDecoration(
-                      color: sel
-                          ? AppColors.soft(AppColors.success, 0.14)
-                          : AppColors.surfaceMuted,
-                      borderRadius: AppRadius.rPill,
-                      border: Border.all(
-                        color: sel
-                            ? AppColors.soft(AppColors.success, 0.4)
-                            : AppColors.border,
-                      ),
-                    ),
-                    child: Text(
-                      e.value,
-                      style: AppType.label.copyWith(
-                        color:
-                            sel ? AppColors.success : AppColors.textSecondary,
-                      ),
-                    ),
-                  ),
-                );
-              }).toList(),
-            ),
-            const SizedBox(height: AppSpacing.md),
-            TextField(
-              controller: amountCtrl,
-              keyboardType: TextInputType.number,
-              inputFormatters: [RupiahInputFormatter()],
-              style: AppType.title,
-              decoration: _fieldDecoration(
-                label: 'Jumlah bayar',
-                accent: AppColors.success,
-                prefixText: 'Rp ',
-              ),
-            ),
-            const SizedBox(height: AppSpacing.md),
-            TextField(
-              controller: pinCtrl,
-              obscureText: true,
-              keyboardType: TextInputType.number,
-              decoration: _fieldDecoration(
-                label: 'PIN otorisasi (Manager/SVP)',
-                accent: AppColors.success,
-                prefixIcon: Icons.lock_outline_rounded,
-              ),
-            ),
-            const SizedBox(height: AppSpacing.lg),
-            Row(
-              children: [
-                Expanded(
-                  child: AppButton.neutral(
-                    'Batal',
-                    onPressed: () => Navigator.pop(ctx, false),
-                  ),
-                ),
-                const SizedBox(width: AppSpacing.sm),
-                Expanded(
-                  child: AppButton(
-                    label: 'Bayar',
-                    icon: Icons.check_rounded,
-                    variant: AppButtonVariant.success,
-                    onPressed: () => Navigator.pop(ctx, true),
-                  ),
-                ),
-              ],
-            ),
-          ],
+      text: CurrencyHelper.formatInput(remaining.round()),
+    );
+    await showDialog(
+      context: context,
+      barrierDismissible: true,
+      builder: (ctx) => Dialog(
+        insetPadding: const EdgeInsets.symmetric(horizontal: 32, vertical: 40),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+        child: CashierPaymentSheet(
+          total: remaining,
+          controller: amountCtrl,
+          onPay: (method, amount) async {
+            Navigator.pop(ctx);
+            await _processPayment(order, method, amount);
+          },
         ),
       ),
     );
-    if (ok != true || !mounted) return;
-    final amount = CurrencyHelper.parseInput(amountCtrl.text);
+  }
+
+  Future<void> _processPayment(
+      Order order, String method, double amount) async {
+    // QRIS terintegrasi: uang harus terkonfirmasi penyedia SEBELUM pembayaran
+    // dicatat — sama seperti kasir. Outlet tanpa gateway lewat begitu saja.
+    if (method == 'qris' && !await _confirmQrisPaid(order, amount)) return;
+    if (!mounted) return;
+
+    final auth = await showPinAuthDialog(
+      context,
+      title: 'Otorisasi Pembayaran',
+      actionLabel: 'Bayar ${CurrencyHelper.format(amount)}',
+      actionColor: AppColors.success,
+      icon: Icons.payments_rounded,
+      askReason: false,
+      details: {
+        'Meja': order.tableNumber,
+        'Sisa tagihan': CurrencyHelper.format(order.remaining),
+        'Metode': _methodLabel(method),
+      },
+    );
+    if (auth == null || !mounted) return;
+
     final result = await _controller.payOrder(
       orderId: order.id,
       paymentMethod: method,
       paidAmount: amount,
-      pin: pinCtrl.text.trim(),
+      pin: auth.pin,
     );
     if (!mounted || result == null) return; // error via snackbar _onStateChanged
     final change = (result['change'] as num?)?.toDouble() ?? 0;
@@ -267,6 +351,38 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
           : 'Lunas — struk dicetak',
     );
   }
+
+  /// Terbitkan QR dan tunggu penyedia mengonfirmasi pembayaran (sama seperti
+  /// kasir). Outlet yang belum tersambung gateway tetap boleh lanjut — QRIS-nya
+  /// dianggap manual.
+  Future<bool> _confirmQrisPaid(Order order, double amount) async {
+    final info = await QrisService.instance.info();
+    if (info == null || info['enabled'] != true) return true;
+    if (!mounted) return false;
+
+    final paid = await showQrisPaymentDialog(
+      context,
+      orderId: order.id,
+      amount: amount,
+      description: 'Meja ${order.tableNumber}',
+    );
+    if (paid == true) return true;
+
+    if (mounted) {
+      showAppSnack(context,
+          'Pembayaran QRIS belum terkonfirmasi — tidak dicatat',
+          isError: true);
+    }
+    return false;
+  }
+
+  String _methodLabel(String method) => const {
+        'cash': 'Tunai',
+        'card': 'Kartu',
+        'qris': 'QRIS',
+        'transfer': 'Transfer',
+      }[method] ??
+      method;
 
   /// Void transaksi lunas — wajib PIN Manager/SVP (atau PIN void bersama).
   Future<void> _showVoidDialog(Order order) async {
@@ -363,6 +479,11 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
                             order: selected,
                             onPay: _showPayDialog,
                             onVoid: _showVoidDialog,
+                            extraActions: selected != null &&
+                                    !selected.isPaid &&
+                                    !selected.isVoided
+                                ? _actionsPanel(selected)
+                                : null,
                           ),
                         ),
                       ],
@@ -451,33 +572,6 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
       ),
     );
   }
-}
-
-// ── Field decoration helper (input pada modal bayar) ──────────────────────────
-
-InputDecoration _fieldDecoration({
-  required String label,
-  required Color accent,
-  String? prefixText,
-  IconData? prefixIcon,
-}) {
-  OutlineInputBorder border(Color c, [double w = 1]) => OutlineInputBorder(
-        borderRadius: AppRadius.rMd,
-        borderSide: BorderSide(color: c, width: w),
-      );
-  return InputDecoration(
-    labelText: label,
-    prefixText: prefixText,
-    prefixIcon: prefixIcon != null
-        ? Icon(prefixIcon, color: AppColors.textTertiary, size: 20)
-        : null,
-    filled: true,
-    fillColor: AppColors.surfaceMuted,
-    labelStyle: AppType.body.copyWith(color: AppColors.textSecondary),
-    border: border(AppColors.border),
-    enabledBorder: border(AppColors.border),
-    focusedBorder: border(accent, 1.6),
-  );
 }
 
 // ── Revenue Card ──────────────────────────────────────────────────────────────
@@ -732,10 +826,14 @@ class _DetailPanel extends StatelessWidget {
   final void Function(Order) onPay;
   final void Function(Order) onVoid;
 
+  /// Panel "Aksi Lainnya" (sama seperti Kasir) untuk transaksi belum dibayar.
+  final Widget? extraActions;
+
   const _DetailPanel({
     required this.order,
     required this.onPay,
     required this.onVoid,
+    this.extraActions,
   });
 
   @override
@@ -829,14 +927,18 @@ class _DetailPanel extends StatelessWidget {
           const SizedBox(height: AppSpacing.md),
           if (o.isVoided)
             const _VoidNote()
-          else if (!o.isPaid)
+          else if (!o.isPaid) ...[
             AppButton(
               label: 'Bayar',
               icon: Icons.payments_rounded,
               variant: AppButtonVariant.success,
               onPressed: () => onPay(o),
-            )
-          else
+            ),
+            if (extraActions != null) ...[
+              const SizedBox(height: AppSpacing.sm),
+              extraActions!,
+            ],
+          ] else
             AppButton(
               label: 'Void Transaksi',
               icon: Icons.block_rounded,

@@ -596,6 +596,47 @@ class StationApiClient {
     });
   }
 
+  /// Order aktif + itemnya untuk layar Dapur/Bar station.
+  Future<List<Map<String, dynamic>>> getKitchenOrders() async {
+    return _withRetry(() async {
+      final resp = await _dio.get('$_base/api/kitchen/orders');
+      final data = resp.data is Map ? resp.data['data'] : null;
+      final list = data is Map ? data['orders'] : null;
+      if (list is! List) return <Map<String, dynamic>>[];
+      return list
+          .whereType<Map>()
+          .map((m) => m.cast<String, dynamic>())
+          .toList();
+    });
+  }
+
+  /// Ubah status masak item dari layar Dapur/Bar station.
+  Future<void> updateItemStatus(String itemId, String status) async {
+    return _withRetry(idempotent: false, () async {
+      await _dio.post('$_base/api/order-items/$itemId/status',
+          data: {'status': status});
+    });
+  }
+
+  /// Ganti shift: tutup shift berjalan, buka shift baru untuk [handoverTo].
+  /// Tidak idempotent — jangan diulang otomatis saat timeout.
+  Future<Map<String, dynamic>> swapShift({
+    required String shiftId,
+    required String handoverTo,
+    double? countedCash,
+    String? notes,
+  }) async {
+    return _withRetry(idempotent: false, () async {
+      final resp = await _dio.post('$_base/api/shift/swap', data: {
+        'shift_id': shiftId,
+        'handover_to': handoverTo,
+        if (countedCash != null) 'counted_cash': countedCash,
+        if (notes != null && notes.isNotEmpty) 'notes': notes,
+      });
+      return _data(resp);
+    });
+  }
+
   Future<Map<String, dynamic>> closeShift({
     required String shiftId,
     required String closedBy,
@@ -683,6 +724,10 @@ class StationApiClient {
     _wsShouldReconnect = false;
     _wsReconnectTimer?.cancel();
     _wsReconnectTimer = null;
+    // Lepas callback-nya juga: kalau tidak, klien singleton ini masih memegang
+    // closure milik layar/controller yang sudah di-dispose, dan sambungan ulang
+    // berikutnya memanggilnya → "used after being disposed".
+    _wsOnEvent = null;
     _closeWs();
   }
 }

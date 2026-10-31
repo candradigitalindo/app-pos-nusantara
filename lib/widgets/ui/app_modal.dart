@@ -56,20 +56,27 @@ Future<T?> showAppModal<T>(
     pageBuilder: (ctx, a1, a2) => const SizedBox.shrink(),
     transitionBuilder: (ctx, anim, sec, _) {
       final curved = CurvedAnimation(parent: anim, curve: AppMotion.easeOut);
+      // Keyboard hanya mendorong dari BAWAH. Dulu inset dipakai simetris
+      // (atas + bawah) sehingga modal berisi beberapa kolom isian bisa
+      // kehabisan ruang dan tampil "BOTTOM OVERFLOWED" saat keyboard muncul.
+      final insets = MediaQuery.viewInsetsOf(ctx).bottom;
+      final available = MediaQuery.sizeOf(ctx).height - insets;
       return Opacity(
         opacity: curved.value,
         child: Transform.scale(
           scale: 0.96 + 0.04 * curved.value,
           child: Center(
             child: Padding(
-              padding: EdgeInsets.symmetric(
-                horizontal: AppSpacing.xl,
-                vertical: MediaQuery.viewInsetsOf(ctx).bottom + AppSpacing.xl,
+              padding: EdgeInsets.only(
+                left: AppSpacing.xl,
+                right: AppSpacing.xl,
+                top: AppSpacing.xl,
+                bottom: insets + AppSpacing.xl,
               ),
               child: ConstrainedBox(
                 constraints: BoxConstraints(
                   maxWidth: maxWidth,
-                  maxHeight: MediaQuery.sizeOf(ctx).height * 0.86,
+                  maxHeight: available * 0.86,
                 ),
                 child: content(ctx),
               ),

@@ -318,6 +318,7 @@ class Order {
 class OrderItem {
   final String id;
   final String orderId;
+  final String? productId;
   final String productName;
   final String? categoryId; // kategori asal item (untuk routing cetak per-printer)
   final int qty;
@@ -334,6 +335,7 @@ class OrderItem {
   const OrderItem({
     required this.id,
     required this.orderId,
+    this.productId,
     required this.productName,
     this.categoryId,
     required this.qty,
@@ -380,6 +382,7 @@ class OrderItem {
   Map<String, dynamic> toMap() => {
         'id': id,
         'order_id': orderId,
+        'product_id': productId,
         'product_name': productName,
         'category_id': categoryId,
         'qty': qty,
@@ -397,6 +400,7 @@ class OrderItem {
   factory OrderItem.fromMap(Map<String, dynamic> map) => OrderItem(
         id: map['id'] as String,
         orderId: map['order_id'] as String,
+        productId: map['product_id'] as String?,
         productName: map['product_name'] as String,
         categoryId: map['category_id'] as String?,
         qty: map['qty'] as int,

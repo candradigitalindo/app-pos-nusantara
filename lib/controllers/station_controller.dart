@@ -49,12 +49,21 @@ class StationController extends ChangeNotifier {
 
   // ── Lifecycle ───────────────────────────────────────────────────────────────
 
+  bool _disposed = false;
+
   Future<void> init() async {
     await loadTables();
     await _loadCategories();
-    // Real-time: refresh meja saat ada order baru / item ditambah dari device lain
+    // Layar bisa dilepas selagi dua request di atas masih jalan (mis. kena
+    // auto-logout idle) — jangan pasang socket untuk controller yang sudah mati.
+    if (_disposed) return;
+    // Real-time: refresh meja saat ada order baru/item ditambah, atau saat
+    // order lunas (meja jadi bebas lagi) dari device lain.
     _api.connectWebSocket((event, _) {
-      if (event == 'order_created' || event == 'order_items_added') {
+      if (event == 'order_created' ||
+          event == 'order_items_added' ||
+          event == 'order_paid' ||
+          event == 'order_updated') {
         loadTables();
       }
     });
@@ -62,8 +71,18 @@ class StationController extends ChangeNotifier {
 
   @override
   void dispose() {
+    _disposed = true;
     _api.disconnectWebSocket();
     super.dispose();
+  }
+
+  /// Request async bisa selesai setelah controller di-dispose (auto-logout idle
+  /// saat request masih jalan, atau event socket yang telat). Diamkan saja,
+  /// jangan sampai melempar "used after being disposed".
+  @override
+  void notifyListeners() {
+    if (_disposed) return;
+    super.notifyListeners();
   }
 
   void clearMessages() {

@@ -17,13 +17,20 @@ class DeviceRoleService {
 
   static const _key = 'device_role';
 
+  DeviceRole? _cached;
+
+  /// Peran terakhir yang dibaca/di-set — versi SINKRON untuk pemeriksaan cepat
+  /// di widget yang tak bisa menunggu Future (mis. guard idle di app shell).
+  /// Terisi saat RootGate memuat peran di awal aplikasi.
+  DeviceRole? get cachedRole => _cached;
+
   /// Null = belum dipilih (tampilkan pemilih peran).
   Future<DeviceRole?> getRole() async {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getString(_key);
-    if (raw == 'main_pos') return DeviceRole.mainPos;
-    if (raw == 'station') return DeviceRole.station;
-    return null;
+    if (raw == 'main_pos') return _cached = DeviceRole.mainPos;
+    if (raw == 'station') return _cached = DeviceRole.station;
+    return _cached = null;
   }
 
   Future<void> setRole(DeviceRole role) async {
@@ -32,11 +39,13 @@ class DeviceRoleService {
       _key,
       role == DeviceRole.mainPos ? 'main_pos' : 'station',
     );
+    _cached = role;
   }
 
   Future<void> clear() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_key);
+    _cached = null;
   }
 
   // ── Service startup (hanya untuk Main POS) ───────────────────────────────────

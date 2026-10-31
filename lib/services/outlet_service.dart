@@ -1,7 +1,21 @@
 import 'package:shared_preferences/shared_preferences.dart';
 
+/// Lingkungan server cloud yang dipakai POS.
+///
+/// - [production] mengunci URL ke [OutletService.productionCloudApiUrl].
+/// - [development] membebaskan pengguna mengisi URL server sendiri.
+enum CloudEnv {
+  production,
+  development;
+
+  static CloudEnv fromValue(String? value) =>
+      value == development.name ? development : production;
+
+  String get label => this == production ? 'Production' : 'Development';
+}
+
 class OutletService {
-  static const String defaultCloudApiUrl = 'https://pos.nbp.co.id';
+  static const String productionCloudApiUrl = 'https://pos.nbp.co.id';
 
   static const _keyName = 'outlet_name';
   static const _keyCode = 'outlet_code';
@@ -10,6 +24,7 @@ class OutletService {
   static const _keySocial = 'outlet_social';
   static const _keyReceiptFooter = 'outlet_receipt_footer';
   static const _keyTargetSpend = 'outlet_target_spend_per_pax';
+  static const _keyCloudEnv = 'outlet_cloud_env';
   static const _keyCloudApiUrl = 'outlet_cloud_api_url';
   static const _keyCloudApiKey = 'outlet_cloud_api_key';
   static const _keyCloudOutletId = 'outlet_cloud_outlet_id';
@@ -21,9 +36,13 @@ class OutletService {
 
   Future<OutletInfo> loadOutlet() async {
     final prefs = await _prefs;
-    var cloudApiUrl = prefs.getString(_keyCloudApiUrl) ?? defaultCloudApiUrl;
-    if (cloudApiUrl == 'https://api-pos.nbp.co.id') {
-      cloudApiUrl = defaultCloudApiUrl;
+    final cloudEnv = CloudEnv.fromValue(prefs.getString(_keyCloudEnv));
+    var cloudApiUrl = prefs.getString(_keyCloudApiUrl) ?? productionCloudApiUrl;
+    // Mode production selalu terkunci ke URL resmi; URL lama ikut dimigrasi.
+    if ((cloudEnv == CloudEnv.production ||
+            cloudApiUrl == 'https://api-pos.nbp.co.id') &&
+        cloudApiUrl != productionCloudApiUrl) {
+      cloudApiUrl = productionCloudApiUrl;
       await prefs.setString(_keyCloudApiUrl, cloudApiUrl);
     }
     return OutletInfo(
@@ -34,6 +53,7 @@ class OutletService {
       socialMedia: prefs.getString(_keySocial) ?? '',
       receiptFooter: prefs.getString(_keyReceiptFooter) ?? '',
       targetSpendPerPax: prefs.getInt(_keyTargetSpend) ?? 0,
+      cloudEnv: cloudEnv,
       cloudApiUrl: cloudApiUrl,
       cloudApiKey: prefs.getString(_keyCloudApiKey) ?? '',
       cloudOutletId: prefs.getString(_keyCloudOutletId) ?? '',
@@ -62,10 +82,16 @@ class OutletService {
     String? cloudOutletId,
     required bool syncEnabled,
     required int syncInterval,
+    CloudEnv cloudEnv = CloudEnv.production,
   }) async {
     final prefs = await _prefs;
+    // Production mengabaikan URL custom apa pun.
+    final url = cloudEnv == CloudEnv.production
+        ? productionCloudApiUrl
+        : cloudApiUrl.trim();
     await Future.wait([
-      prefs.setString(_keyCloudApiUrl, cloudApiUrl),
+      prefs.setString(_keyCloudEnv, cloudEnv.name),
+      prefs.setString(_keyCloudApiUrl, url),
       prefs.setString(_keyCloudApiKey, cloudApiKey),
       if (cloudOutletId != null) prefs.setString(_keyCloudOutletId, cloudOutletId),
       prefs.setBool(_keySyncEnabled, syncEnabled),
@@ -95,6 +121,7 @@ class OutletInfo {
   final String socialMedia;
   final String receiptFooter;
   final int targetSpendPerPax;
+  final CloudEnv cloudEnv;
   final String cloudApiUrl;
   final String cloudApiKey;
   final String cloudOutletId;
@@ -110,6 +137,7 @@ class OutletInfo {
     this.socialMedia = '',
     this.receiptFooter = '',
     this.targetSpendPerPax = 0,
+    this.cloudEnv = CloudEnv.production,
     this.cloudApiUrl = '',
     this.cloudApiKey = '',
     this.cloudOutletId = '',
@@ -126,6 +154,7 @@ class OutletInfo {
     String? socialMedia,
     String? receiptFooter,
     int? targetSpendPerPax,
+    CloudEnv? cloudEnv,
     String? cloudApiUrl,
     String? cloudApiKey,
     String? cloudOutletId,
@@ -141,6 +170,7 @@ class OutletInfo {
       socialMedia: socialMedia ?? this.socialMedia,
       receiptFooter: receiptFooter ?? this.receiptFooter,
       targetSpendPerPax: targetSpendPerPax ?? this.targetSpendPerPax,
+      cloudEnv: cloudEnv ?? this.cloudEnv,
       cloudApiUrl: cloudApiUrl ?? this.cloudApiUrl,
       cloudApiKey: cloudApiKey ?? this.cloudApiKey,
       cloudOutletId: cloudOutletId ?? this.cloudOutletId,

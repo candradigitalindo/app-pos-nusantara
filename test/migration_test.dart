@@ -1,4 +1,4 @@
-// Verifikasi migrasi DB v10 → v13 terhadap SQLITE ASLI berisi data.
+// Verifikasi migrasi DB v10 → v14 terhadap SQLITE ASLI berisi data.
 //
 // Migrasi-migrasi ini menyentuh tabel yang sudah dipakai di lapangan:
 //
@@ -24,11 +24,14 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 late Database db;
 late File dbFile;
+late Directory testDirectory;
 
 void main() {
   setUpAll(() async {
     sqfliteFfiInit();
     databaseFactory = databaseFactoryFfi;
+    testDirectory = await Directory.systemTemp.createTemp('pos-test-');
+    await databaseFactory.setDatabasesPath(testDirectory.path);
 
     final path = p.join(await getDatabasesPath(), 'pos_resto.db');
     dbFile = File(path);
@@ -41,13 +44,21 @@ void main() {
   });
 
   tearDownAll(() async {
-    await db.close();
-    if (await dbFile.exists()) await dbFile.delete();
+    await AppDatabase.instance.close();
+    await testDirectory.delete(recursive: true);
   });
 
-  test('versi skema naik ke 13', () async {
+  test('versi skema naik ke 14', () async {
     final versi = (await db.rawQuery('PRAGMA user_version')).first.values.first;
-    expect(versi, 13);
+    expect(versi, 14);
+  });
+
+  test('migrasi v14 mempertahankan item lama tanpa menebak identitas produk', () async {
+    final rows = await db.query('order_items');
+    expect(rows.single['id'], 'ITEMLAMA');
+    expect(rows.single['product_name'], 'Nasi Goreng');
+    expect(rows.single['qty'], 2);
+    expect(rows.single['product_id'], isNull);
   });
 
   group('reservasi (migrasi v13)', () {
@@ -202,6 +213,19 @@ Future<void> _bangunDatabaseV10(String path) async {
       is_deleted INTEGER NOT NULL DEFAULT 0
     )
   ''');
+
+  await old.execute('''
+    CREATE TABLE order_items (
+      id TEXT PRIMARY KEY,
+      order_id TEXT NOT NULL,
+      product_name TEXT NOT NULL,
+      qty INTEGER NOT NULL
+    )
+  ''');
+  await old.insert('order_items', {
+    'id': 'ITEMLAMA', 'order_id': 'ORDERLAMA',
+    'product_name': 'Nasi Goreng', 'qty': 2,
+  });
 
   // Bentuk LAMA product_addons: id INTEGER AUTOINCREMENT.
   await old.execute('''

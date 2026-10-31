@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 
 import '../database/database.dart';
+import '../services/app_events.dart';
 import '../models/models.dart';
 import '../services/print_queue_service.dart';
 import '../services/printer_service.dart';
@@ -44,6 +45,7 @@ class OrderRepository {
       final item = OrderItem(
         id: Ulid.generate(),
         orderId: orderId,
+        productId: product.id,
         productName: product.name,
         categoryId: product.categoryId,
         qty: input.qty,
@@ -108,6 +110,7 @@ class OrderRepository {
       waiterName: waiterName ?? '',
     );
 
+    notifyDataChanged('order_created');
     return order;
   }
 
@@ -244,18 +247,19 @@ class OrderRepository {
 
     // Sync status order (kini void) ke cloud
     await _enqueueOrder(orderId, 'upsert');
+    notifyDataChanged('order_updated');
   }
 
-  /// Order aktif (belum lunas, tidak void) yang dibuka dari sebuah reservasi —
-  /// dipakai agar reservasi yang sama tidak dibuka dua kali.
-  Future<Order?> getOpenOrderByReservation(String reservationId) async {
+  /// Order reservasi yang belum dibatalkan, termasuk yang sudah lunas.
+  /// Daftar cloud bisa tertinggal saat offline; order lunas tetap mencegah
+  /// reservasi yang sama dibuka dan ditagih kembali.
+  Future<Order?> getOrderByReservation(String reservationId) async {
     final db = await _db.database;
     final rows = await db.query(
       'orders',
-      where:
-          "reservation_id = ? AND payment_status != 'paid' AND voided_at IS NULL",
+      where: 'reservation_id = ? AND voided_at IS NULL',
       whereArgs: [reservationId],
-      orderBy: 'created_at DESC',
+      orderBy: "CASE WHEN payment_status = 'paid' THEN 0 ELSE 1 END, created_at DESC",
       limit: 1,
     );
     return rows.isEmpty ? null : Order.fromMap(rows.first);
@@ -323,6 +327,7 @@ class OrderRepository {
       orderItems.add(OrderItem(
         id: Ulid.generate(),
         orderId: orderId,
+        productId: product.id,
         productName: product.name,
         categoryId: product.categoryId,
         qty: input.qty,
@@ -357,6 +362,8 @@ class OrderRepository {
       isAdditional: true,
       waiterName: waiterName,
     );
+
+    notifyDataChanged('order_items_added');
   }
 
   /// Backfill: masukkan semua order aktif (belum bayar, belum void) yang belum
@@ -509,6 +516,8 @@ class OrderRepository {
         if (order.isHolding == 1) 'is_holding': true, // order Meja Titipan
         'items': items
             .map((it) => {
+                  'id': it.id,
+                  if (it.productId != null) 'product_id': it.productId,
                   'product_name': it.productName,
                   'qty': it.qty,
                   'price': it.price,
@@ -590,6 +599,7 @@ class OrderRepository {
         );
       }
     }
+    notifyDataChanged('order_updated');
   }
 
   /// VOID (hapus) satu item dari order yang belum lunas. Otorisasi manager/SVP
@@ -633,6 +643,7 @@ class OrderRepository {
     await _reapplyAutoChargesAndRecalc(item.orderId);
     // Kirim status order terbaru (item & total) ke cloud.
     await _enqueueOrder(item.orderId, 'upsert');
+    notifyDataChanged('order_updated');
   }
 
   /// Pisahkan [qty] unit dari baris [itemId] menjadi baris BARU pada order yang
@@ -648,6 +659,7 @@ class OrderRepository {
     final newItem = OrderItem(
       id: Ulid.generate(),
       orderId: item.orderId,
+      productId: item.productId,
       productName: item.productName,
       categoryId: item.categoryId,
       qty: qty,
@@ -680,11 +692,15 @@ class OrderRepository {
       {int? voidQty}) async {
     final q = voidQty ?? item.qty;
     try {
+      // Audit mencatat aksi, bukan hanya snapshot item. Dua aksi pada item
+      // yang sama saat offline harus memiliki entri outbox berbeda.
+      final eventId = Ulid.generate();
       await _sync.enqueue(
         entityType: 'order_item_void',
-        entityId: item.id,
+        entityId: eventId,
         operation: 'create',
         payload: {
+          'event_id': eventId,
           'local_id': item.id,
           'order_id': order.id,
           'table_number': order.tableNumber,
@@ -787,7 +803,7 @@ class OrderRepository {
           TransactionItem(
             id: Ulid.generate(),
             transactionId: transaction.id,
-            productId: '',
+            productId: item.productId ?? '',
             quantity: item.qty,
             price: item.price,
           ).toMap(),
@@ -850,6 +866,7 @@ class OrderRepository {
 
     // Sync status order terbaru (kini 'paid') ke cloud
     await _enqueueOrder(orderId, 'upsert');
+    notifyDataChanged('order_paid');
 
     return {
       'order_id': orderId,
@@ -890,6 +907,7 @@ class OrderRepository {
                 'payment_method': paymentMethod,
                 'amount': paidAmount,
                 'payment_note': null,
+                'created_at': _isoUtc(transaction.transactionDate),
               }
             ]
           : payments;
@@ -945,6 +963,8 @@ class OrderRepository {
             'reservation_id': order.reservationId,
           'items': items
               .map((i) => {
+                    'id': i.id,
+                    if (i.productId != null) 'product_id': i.productId,
                     'product_name': i.productName,
                     'quantity': i.qty,
                     'price': i.price,
@@ -1116,6 +1136,7 @@ class OrderRepository {
 
     // Sync status order terbaru ke cloud
     await _enqueueOrder(orderId, 'upsert');
+    notifyDataChanged('order_paid');
 
     return {
       'order_id': orderId,
@@ -1194,6 +1215,7 @@ class OrderRepository {
     // Sync order (total kini sudah didiskon) ke cloud — selaras app-pos
     // yang memanggil enqueueOrderSync setelah diskon diterapkan.
     await _enqueueOrder(orderId, 'upsert');
+    notifyDataChanged('order_updated');
   }
 
   // ==================== COMPLIMENT ORDER ====================
@@ -1290,6 +1312,7 @@ class OrderRepository {
 
     // Sync status order (compliment, total 0) ke cloud
     await _enqueueOrder(orderId, 'upsert');
+    notifyDataChanged('order_paid');
   }
 
   // ==================== MOVE TABLE ====================
@@ -1344,6 +1367,7 @@ class OrderRepository {
 
     // Sync order (nomor meja baru) ke cloud
     await _enqueueOrder(orderId, 'upsert');
+    notifyDataChanged('order_updated');
   }
 
   /// Gabung order [sourceOrderId] ke [targetOrderId]: pindahkan semua item ke
@@ -1416,6 +1440,7 @@ class OrderRepository {
     await _applyAutoCharges(targetOrderId);
     await _enqueueOrder(targetOrderId, 'upsert');
     await _enqueueOrder(sourceOrderId, 'upsert');
+    notifyDataChanged('order_updated');
   }
 
   /// Order aktif (belum bayar, belum void, bukan hasil-gabung) di meja LAIN —
@@ -1521,6 +1546,7 @@ class OrderRepository {
 
     await _enqueueOrder(sourceOrderId, 'upsert');
     await _enqueueOrder(targetOrderId, 'upsert');
+    notifyDataChanged('order_updated');
   }
 
   // ==================== MEJA TITIPAN (parked check) ====================
@@ -1572,11 +1598,15 @@ class OrderRepository {
     required DateTime at,
   }) async {
     try {
+      // Audit mencatat aksi, bukan hanya snapshot item. Dua aksi pada item
+      // yang sama saat offline harus memiliki entri outbox berbeda.
+      final eventId = Ulid.generate();
       await _sync.enqueue(
         entityType: 'order_item_titipan',
-        entityId: item.id,
+        entityId: eventId,
         operation: 'create',
         payload: {
+          'event_id': eventId,
           'local_id': item.id,
           'action': action,
           'product_name': item.productName,

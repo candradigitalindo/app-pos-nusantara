@@ -108,16 +108,53 @@ class KitchenState {
   }
 }
 
+/// Sumber data layar Dapur/Bar.
+///
+/// Perangkat utama membacanya dari DB lokal; STATION membacanya dari Main POS
+/// lewat API. Layar & controller-nya sama persis — hanya sumber datanya beda.
+abstract class KitchenDataSource {
+  Future<Map<Order, List<OrderItem>>> activeOrdersWithItems();
+  Future<void> updateItemStatus(String itemId, String status);
+
+  /// Pantau perubahan dari sumber data (mis. WebSocket station). Perangkat
+  /// utama tak perlu ini karena sudah memakai AppEvents.
+  void watch(void Function() onChanged) {}
+  void unwatch() {}
+}
+
+/// Sumber data bawaan: DB perangkat ini sendiri.
+class LocalKitchenSource implements KitchenDataSource {
+  final OrderRepository _repo;
+  LocalKitchenSource({OrderRepository? repo}) : _repo = repo ?? OrderRepository();
+
+  @override
+  Future<Map<Order, List<OrderItem>>> activeOrdersWithItems() =>
+      _repo.getActiveOrdersWithItems();
+
+  @override
+  Future<void> updateItemStatus(String itemId, String status) =>
+      _repo.updateItemStatus(itemId, status);
+
+  @override
+  void watch(void Function() onChanged) {}
+
+  @override
+  void unwatch() {}
+}
+
 /// Controller untuk KitchenScreen.
 class KitchenController extends ChangeNotifier {
-  final OrderRepository _orderRepo;
+  final KitchenDataSource _source;
   final PrinterService _printer;
 
   KitchenState _state = const KitchenState();
   KitchenState get state => _state;
 
-  KitchenController({OrderRepository? orderRepo, PrinterService? printer})
-      : _orderRepo = orderRepo ?? OrderRepository(),
+  KitchenController({
+    KitchenDataSource? source,
+    OrderRepository? orderRepo,
+    PrinterService? printer,
+  })  : _source = source ?? LocalKitchenSource(repo: orderRepo),
         _printer = printer ?? PrinterService();
 
   void _setState(KitchenState newState) {
@@ -132,7 +169,7 @@ class KitchenController extends ChangeNotifier {
   Future<void> loadOrders() async {
     _setState(_state.copyWith(isLoading: true, clearError: true));
     try {
-      final ordersWithItems = await _orderRepo.getActiveOrdersWithItems();
+      final ordersWithItems = await _source.activeOrdersWithItems();
       // Stasiun = printer prep (bukan kasir & bukan checker).
       final printers = await _printer.getSavedPrinters();
       final stations = printers
@@ -162,7 +199,7 @@ class KitchenController extends ChangeNotifier {
 
   Future<void> updateItemStatus(String itemId, String newStatus) async {
     try {
-      await _orderRepo.updateItemStatus(itemId, newStatus);
+      await _source.updateItemStatus(itemId, newStatus);
       _setState(_state.copyWith(
           ordersWithItems: _applyStatus({itemId}, newStatus)));
     } catch (e) {
@@ -176,7 +213,7 @@ class KitchenController extends ChangeNotifier {
     if (itemIds.isEmpty) return;
     try {
       for (final id in itemIds) {
-        await _orderRepo.updateItemStatus(id, newStatus);
+        await _source.updateItemStatus(id, newStatus);
       }
       _setState(_state.copyWith(
           ordersWithItems: _applyStatus(itemIds.toSet(), newStatus)));
@@ -209,6 +246,7 @@ class KitchenController extends ChangeNotifier {
           return OrderItem(
             id: item.id,
             orderId: item.orderId,
+            productId: item.productId,
             productName: item.productName,
             categoryId: item.categoryId,
             qty: item.qty,

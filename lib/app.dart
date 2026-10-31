@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -7,6 +9,8 @@ import 'services/auth_service.dart';
 import 'services/data_retention_service.dart';
 import 'services/device_role_service.dart';
 import 'services/station_api_client.dart';
+import 'services/station_kitchen_source.dart';
+import 'screens/kitchen/kitchen_screen.dart';
 import 'screens/login/login_screen.dart';
 import 'screens/dashboard/dashboard_screen.dart';
 import 'screens/role/role_selector_screen.dart';
@@ -14,10 +18,16 @@ import 'screens/station/station_screen.dart';
 import 'screens/station/station_login_screen.dart';
 import 'screens/station/cashier_station_screen.dart';
 import 'screens/station/station_setup_screen.dart';
+import 'widgets/ui/ui.dart';
 
 final authProvider = StateNotifierProvider<AuthNotifier, AuthState>((ref) {
   return AuthNotifier();
 });
+
+/// Navigator root — dipakai guard idle-logout utk mengembalikan navigasi ke
+/// Dashboard sebelum logout, walau waiter sedang di layar Meja/Waiter yang
+/// di-push di atas Dashboard.
+final navigatorKey = GlobalKey<NavigatorState>();
 
 class AuthState {
   final User? user;
@@ -106,8 +116,93 @@ class PosRestoApp extends StatelessWidget {
         title: 'POS Resto',
         debugShowCheckedModeBanner: false,
         theme: AppTheme.light,
+        navigatorKey: navigatorKey,
+        builder: (context, child) =>
+            _WaiterIdleGuard(child: child ?? const SizedBox.shrink()),
         home: const RootGate(),
       ),
+    );
+  }
+}
+
+/// Auto-logout saat idle di Main POS — KHUSUS role waiter (tablet mereka
+/// sering ditinggal di meja pelanggan, tak seperti kasir/admin yang stay di
+/// satu titik). Aturannya sama dengan mode Station: idle → peringatan 10 detik
+/// → kalau tak direspons, logout paksa. Dipasang di MaterialApp.builder (di
+/// atas Navigator) supaya sentuhan di layar manapun yang bisa diakses waiter
+/// (Dashboard, Meja, Waiter) ikut mereset timer.
+///
+/// HANYA untuk perangkat Main POS: mode Station punya guard idle sendiri di
+/// StationScreen/CashierStationScreen (sesinya juga bukan authProvider,
+/// melainkan StationGate). Tanpa penjagaan peran perangkat, sesi Main POS lama
+/// yang masih tersimpan di tablet yang kini dipakai sebagai Station bikin dua
+/// timer idle jalan bersamaan → dialog peringatan dobel.
+class _WaiterIdleGuard extends ConsumerStatefulWidget {
+  final Widget child;
+  const _WaiterIdleGuard({required this.child});
+
+  @override
+  ConsumerState<_WaiterIdleGuard> createState() => _WaiterIdleGuardState();
+}
+
+class _WaiterIdleGuardState extends ConsumerState<_WaiterIdleGuard> {
+  static const _idleSeconds = 10;
+  static const _warnSeconds = 10;
+  Timer? _idleTimer;
+  bool _warningShown = false;
+
+  void _resetIdle(String? role) {
+    _idleTimer?.cancel();
+    if (DeviceRoleService.instance.cachedRole != DeviceRole.mainPos) return;
+    if (role != 'waiter' || _warningShown) return;
+    _idleTimer = Timer(const Duration(seconds: _idleSeconds), _onIdle);
+  }
+
+  Future<void> _onIdle() async {
+    if (_warningShown) return;
+    if (DeviceRoleService.instance.cachedRole != DeviceRole.mainPos) return;
+    final ctx = navigatorKey.currentContext;
+    if (ctx == null) return;
+    _warningShown = true;
+    final stay = await showDialog<bool>(
+      context: ctx,
+      barrierDismissible: false,
+      builder: (_) => const IdleWarningDialog(seconds: _warnSeconds),
+    );
+    _warningShown = false;
+    if (!mounted) return;
+    final role = ref.read(authProvider).user?.role;
+    if (role != 'waiter') return; // sudah logout/ganti peran selagi dialog terbuka
+    if (stay == true) {
+      _resetIdle(role);
+    } else {
+      // Kembalikan navigasi ke root dulu (waiter mungkin sedang di layar Meja
+      // /Waiter yang di-push di atas Dashboard) baru logout, agar LoginScreen
+      // benar-benar terlihat, bukan tersembunyi di bawah route yang di-push.
+      navigatorKey.currentState?.popUntil((r) => r.isFirst);
+      await ref.read(authProvider.notifier).logout();
+    }
+  }
+
+  @override
+  void dispose() {
+    _idleTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Pasang/lepas timer HANYA saat peran benar-benar berubah (login/logout),
+    // bukan setiap rebuild — kalau tidak, timer ke-reset diam-diam tiap kali
+    // ada state lain yang berubah di aplikasi.
+    ref.listen<String?>(
+      authProvider.select((s) => s.user?.role),
+      (previous, next) => _resetIdle(next),
+    );
+    return Listener(
+      behavior: HitTestBehavior.translucent,
+      onPointerDown: (_) => _resetIdle(ref.read(authProvider).user?.role),
+      child: widget.child,
     );
   }
 }
@@ -266,6 +361,15 @@ class _StationGateState extends State<StationGate> {
         role == 'svp';
     if (isCashier) {
       return CashierStationScreen(user: _user!, onLogout: _logout);
+    }
+    // Dapur/Bar TIDAK dilempar ke layar waiter (dulu begitu, sehingga orang
+    // dapur bisa membuat pesanan atas nama waiter). Mereka mendapat layar
+    // Dapur/Bar yang sama dengan perangkat utama, datanya dari Main POS.
+    if (role == 'kitchen' || role == 'bar') {
+      return KitchenScreen(
+        source: StationKitchenSource(),
+        onExit: _logout,
+      );
     }
     return StationScreen(
       user: _user!,

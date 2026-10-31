@@ -12,6 +12,7 @@ import '../repositories/sync_queue_repository.dart';
 import '../utils/ulid.dart';
 import 'device_heartbeat_service.dart';
 import 'online_order_service.dart';
+import 'sync_acknowledgements.dart';
 import 'outlet_service.dart';
 
 /// Mengirim outbox (sync_queue) ke cloud-pos via endpoint BatchSync.
@@ -253,10 +254,12 @@ class CloudSyncService {
         // Kontrak cloud: `success:true` di level atas HARDCODED — cloud selalu
         // balas 200 + success:true asalkan request valid, MESKI ada item yang
         // gagal tersimpan. Keandalan sebenarnya ada di `data.results[]`:
-        // tiap item sukses punya {local_id, status:"success"}.
+        // tiap item sukses punya {entity_type, local_id, status:"success"};
+        // event audit juga memiliki event_id agar dua aksi pada item yang
+        // sama tidak saling mengonfirmasi.
         //
-        // Maka: tandai "synced" HANYA untuk local_id yang cloud konfirmasi
-        // status=="success". Item ber-status "failed" ATAU yang TIDAK muncul di
+        // Maka: tandai "synced" HANYA untuk satu entri yang dapat dicocokkan
+        // tanpa ambigu dengan status=="success". Item gagal/tidak muncul di
         // results[] harus TETAP di outbox & di-retry (jangan pernah andalkan
         // success:true level atas → kalau tidak, transaksi gagal tersimpan di
         // cloud akan ditandai terkirim di tablet dan HILANG permanen).
@@ -280,22 +283,15 @@ class CloudSyncService {
           return {'sent': rows.length, 'success': 0, 'failed': rows.length};
         }
 
-        final syncedIds = <String>{};
-        for (final it in results) {
-          if (it is Map && it['status'] == 'success') {
-            final lid = it['local_id'];
-            if (lid is String) syncedIds.add(lid);
-          }
-        }
+        final confirmedIds = confirmedSyncQueueIds(rows, results);
 
         var success = 0;
         var failed = 0;
         for (final r in rows) {
           final id = r['id'] as int;
-          final entityId = r['entity_id'] as String;
           final retry = r['retry_count'] as int;
           final maxRetries = r['max_retries'] as int;
-          if (syncedIds.contains(entityId)) {
+          if (confirmedIds.contains(id)) {
             await _queue.markSuccess(id);
             success++;
           } else {
@@ -598,7 +594,7 @@ class CloudSyncService {
   }
 
   Future<void> _restoreShift(dynamic txn, Map s) async {
-    final id = _pick(s, ['id', 'local_id']);
+    final id = _pick(s, ['local_id', 'id']);
     if (id.isEmpty) return;
     final now = DateTime.now().toIso8601String();
     await txn.insert(
@@ -617,7 +613,7 @@ class CloudSyncService {
   }
 
   Future<void> _restoreUnpaidOrder(dynamic txn, Map o) async {
-    final id = _pick(o, ['id', 'local_id']);
+    final id = _pick(o, ['local_id', 'id']);
     if (id.isEmpty) return;
     final items = _asList(o['items']);
     final pay = o['payment_info'] is Map ? o['payment_info'] as Map : const {};
@@ -649,6 +645,7 @@ class CloudSyncService {
       await txn.insert('order_items', {
         'id': Ulid.generate(),
         'order_id': id,
+        'product_id': _pickOrNull(it, ['product_id']),
         'product_name': _pick(it, ['product_name', 'name'], '-'),
         'qty': _intOf(it, ['qty', 'quantity'], 1).clamp(1, 99999),
         'price': _numOf(it, ['price']),
@@ -664,7 +661,7 @@ class CloudSyncService {
   }
 
   Future<void> _restoreCashMovement(dynamic txn, Map m) async {
-    final id = _pick(m, ['id', 'local_id']);
+    final id = _pick(m, ['local_id', 'id']);
     if (id.isEmpty) return;
     final now = DateTime.now().toIso8601String();
     await txn.insert(

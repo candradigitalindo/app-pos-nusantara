@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../controllers/waiter_controller.dart';
 import '../../models/models.dart';
+import '../../services/app_events.dart';
 import '../../theme/theme.dart';
 import '../../widgets/addon_picker_dialog.dart';
 import '../../utils/currency.dart';
@@ -16,7 +17,8 @@ class WaiterScreen extends StatefulWidget {
   State<WaiterScreen> createState() => _WaiterScreenState();
 }
 
-class _WaiterScreenState extends State<WaiterScreen> {
+class _WaiterScreenState extends State<WaiterScreen>
+    with AppEventsRefresh<WaiterScreen> {
   late final WaiterController _controller;
   String _searchQuery = '';
   String _filterStatus = 'all';
@@ -28,6 +30,14 @@ class _WaiterScreenState extends State<WaiterScreen> {
     _controller = WaiterController();
     _controller.addListener(_onStateChanged);
     _controller.loadTables();
+    listenDataChanges();
+  }
+
+  /// Daftar meja disegarkan hanya saat waiter TIDAK sedang menyusun pesanan,
+  /// supaya keranjang/menu yang sedang dibuka tidak terganggu.
+  @override
+  void onDataChanged() {
+    if (_controller.state.viewMode == 'tables') _controller.loadTables();
   }
 
   @override
@@ -38,6 +48,7 @@ class _WaiterScreenState extends State<WaiterScreen> {
 
   @override
   void dispose() {
+    cancelDataChanges();
     _menuSearchCtrl.dispose();
     _controller.dispose();
     super.dispose();

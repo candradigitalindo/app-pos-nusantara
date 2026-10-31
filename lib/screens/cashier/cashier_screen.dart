@@ -4,18 +4,23 @@ import 'package:flutter/material.dart';
 
 import '../../controllers/cashier_controller.dart';
 import '../../models/models.dart';
+import '../../repositories/cashier_repository.dart';
+import '../../repositories/order_repository.dart';
+import '../../services/app_events.dart';
+import '../../services/cash_drawer_service.dart';
 import '../../services/cloud_sync_service.dart';
 import '../../services/qris_service.dart';
 import '../../services/reservation_service.dart';
 import '../../theme/theme.dart';
 import '../../utils/currency.dart';
 import '../../widgets/addon_picker_dialog.dart';
-import '../../widgets/menu_avatar.dart';
 import '../../widgets/pax_input_dialog.dart';
 import '../../widgets/pin_auth_dialog.dart';
 import '../../widgets/qris_payment_dialog.dart';
 import '../../widgets/reservation_picker_dialog.dart';
 import '../../widgets/ui/ui.dart';
+import 'cashier_order_actions.dart';
+import 'cashier_widgets.dart';
 
 class CashierScreen extends StatefulWidget {
   final String? initialTableNumber;
@@ -25,7 +30,11 @@ class CashierScreen extends StatefulWidget {
   State<CashierScreen> createState() => _CashierScreenState();
 }
 
-class _CashierScreenState extends State<CashierScreen> {
+class _CashierScreenState extends State<CashierScreen>
+    with AppEventsRefresh<CashierScreen>, CashierOrderActions<CashierScreen> {
+  @override
+  CashierController get actionsController => _controller;
+
   late final CashierController _controller;
   late final TextEditingController _openShiftCtrl;
 
@@ -38,7 +47,6 @@ class _CashierScreenState extends State<CashierScreen> {
 
   // Aksi sekunder keranjang (Diskon/Split/Pindah/dll) disembunyikan default agar
   // tak menutup daftar item di layar kecil; dibuka via toggle "Aksi Lainnya".
-  bool _showMoreActions = false;
 
   @override
   void initState() {
@@ -57,7 +65,13 @@ class _CashierScreenState extends State<CashierScreen> {
     // Perbarui status segera setelah siklus sync (otomatis maupun manual)
     // selesai, tanpa menunggu poll 8-detik berikutnya.
     CloudSyncService.instance.syncing.addListener(_onSyncingChanged);
+    // Order/meja bisa berubah dari perangkat lain (station) atau layar lain
+    // (waiter/dapur) — segarkan tanpa mengganggu keranjang yang sedang disusun.
+    listenDataChanges();
   }
+
+  @override
+  void onDataChanged() => _controller.refreshExternal();
 
   void _onSyncingChanged() {
     if (!CloudSyncService.instance.isSyncing) _refreshSync();
@@ -76,6 +90,7 @@ class _CashierScreenState extends State<CashierScreen> {
 
   @override
   void dispose() {
+    cancelDataChanges();
     _syncTimer?.cancel();
     CloudSyncService.instance.syncing.removeListener(_onSyncingChanged);
     _sync.dispose();
@@ -110,15 +125,6 @@ class _CashierScreenState extends State<CashierScreen> {
     }
   }
 
-  void _showSplitBillDialog() {
-    if (_controller.state.currentOrder == null) return;
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) => _SplitBillDialog(controller: _controller),
-    );
-  }
-
   void _showPaymentDialog() {
     final order = _controller.state.currentOrder;
     if (order == null) return;
@@ -135,7 +141,7 @@ class _CashierScreenState extends State<CashierScreen> {
             const EdgeInsets.symmetric(horizontal: 32, vertical: 40),
         shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(24)),
-        child: _PaymentSheet(
+        child: CashierPaymentSheet(
           total: remaining,
           controller: controller,
           onPay: (method, amount) async {
@@ -246,586 +252,6 @@ class _CashierScreenState extends State<CashierScreen> {
   }
 
   /// Dialog kompliment: catat siapa yang memberi & alasan, lalu gratiskan order.
-  void _showComplimentDialog() {
-    final order = _controller.state.currentOrder;
-    if (order == null) return;
-    final items = _controller.state.orderItems;
-    final pinCtrl = TextEditingController();
-    final reasonCtrl = TextEditingController();
-    String? pinError;
-
-    showDialog(
-      context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setS) {
-          return _actionDialogShell(
-            ctx: ctx,
-            accent: AppColors.moduleWaiter,
-            accentBg: AppColors.warningSoft,
-            icon: Icons.card_giftcard,
-            title: 'Kompliment',
-            subtitle: 'Gratiskan seluruh tagihan order ini',
-            children: [
-              _orderSummaryCard(
-                order: order,
-                items: items,
-                accent: AppColors.moduleWaiter,
-                accentBg: AppColors.warningSoft,
-                accentBorder: AppColors.soft(AppColors.warning, 0.35),
-              ),
-              const SizedBox(height: 16),
-              // Banner total → gratis
-              Container(
-                width: double.infinity,
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-                decoration: BoxDecoration(
-                  color: AppColors.warningSoft,
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: AppColors.soft(AppColors.warning, 0.35)),
-                ),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Text('Total dibayar',
-                        style: TextStyle(
-                            fontSize: 14,
-                            fontWeight: FontWeight.w600,
-                            color: AppColors.moduleWaiter)),
-                    Row(
-                      children: [
-                        Text(CurrencyHelper.format(order.totalAmount),
-                            style: const TextStyle(
-                                fontSize: 14,
-                                color: AppColors.moduleWaiter,
-                                decoration: TextDecoration.lineThrough)),
-                        const SizedBox(width: 10),
-                        const Text('GRATIS',
-                            style: TextStyle(
-                                fontSize: 20,
-                                fontWeight: FontWeight.w900,
-                                color: AppColors.moduleWaiter)),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 18),
-              TextField(
-                controller: pinCtrl,
-                autofocus: true,
-                obscureText: true,
-                keyboardType: TextInputType.number,
-                decoration: InputDecoration(
-                  labelText: 'PIN Manager/SVP *',
-                  hintText: 'Otorisasi kompliment',
-                  prefixIcon: const Icon(Icons.lock_outline, size: 20),
-                  border: const OutlineInputBorder(),
-                  errorText: pinError,
-                ),
-                onChanged: (_) {
-                  if (pinError != null) setS(() => pinError = null);
-                },
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: reasonCtrl,
-                textInputAction: TextInputAction.done,
-                minLines: 1,
-                maxLines: 3,
-                decoration: const InputDecoration(
-                  labelText: 'Alasan (opsional)',
-                  hintText: 'Contoh: tamu VIP, kompensasi keluhan',
-                  prefixIcon: Icon(Icons.notes_outlined, size: 20),
-                  border: OutlineInputBorder(),
-                ),
-              ),
-            ],
-            primaryLabel: 'Gratiskan',
-            primaryIcon: Icons.card_giftcard,
-            onPrimary: () async {
-              final pin = pinCtrl.text.trim();
-              if (pin.isEmpty) {
-                setS(() => pinError = 'Wajib diisi');
-                return;
-              }
-              // Otorisasi sama dengan void: PIN void bersama atau PIN user
-              // ber-role admin/manager/svp. Nama pemberi = pemilik PIN, bukan
-              // teks bebas — jejak kompliment jadi akuntabel.
-              final by = await _controller.complimentAuthorizer(pin);
-              if (by == null) {
-                setS(() =>
-                    pinError = 'PIN salah / tidak berwenang (Manager/SVP)');
-                return;
-              }
-              final ok = await _controller.complimentCurrentOrder(
-                complimentBy: by,
-                reason: reasonCtrl.text.trim(),
-              );
-              if (!ctx.mounted) return;
-              Navigator.pop(ctx);
-              if (!mounted) return;
-              if (ok) {
-                showAppSnack(
-                    context,
-                    'Meja ${order.tableNumber} digratiskan (kompliment oleh $by)',
-                    icon: Icons.card_giftcard);
-              }
-            },
-          );
-        },
-      ),
-    );
-  }
-
-  /// Kerangka dialog aksi yang lebih besar & konsisten (header berwarna,
-  /// konten scrollable, tombol aksi lebar di bawah).
-  Widget _actionDialogShell({
-    required BuildContext ctx,
-    required Color accent,
-    required Color accentBg,
-    required IconData icon,
-    required String title,
-    required String subtitle,
-    required List<Widget> children,
-    required String primaryLabel,
-    required IconData primaryIcon,
-    required Future<void> Function() onPrimary,
-  }) {
-    return Dialog(
-      insetPadding: const EdgeInsets.symmetric(horizontal: 32, vertical: 40),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-      child: ConstrainedBox(
-        constraints: BoxConstraints(
-          maxWidth: 520,
-          maxHeight: MediaQuery.of(ctx).size.height * 0.85,
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            // Header
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.fromLTRB(20, 18, 16, 18),
-              decoration: BoxDecoration(
-                color: accentBg,
-                borderRadius:
-                    const BorderRadius.vertical(top: Radius.circular(20)),
-              ),
-              child: Row(
-                children: [
-                  Container(
-                    padding: const EdgeInsets.all(10),
-                    decoration: const BoxDecoration(
-                      color: AppColors.surface,
-                      borderRadius: AppRadius.rSm,
-                    ),
-                    child: Icon(icon, color: accent, size: 24),
-                  ),
-                  const SizedBox(width: 14),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(title, style: AppType.h3.copyWith(color: accent)),
-                        const SizedBox(height: 2),
-                        Text(subtitle,
-                            style: AppType.caption
-                                .copyWith(color: accent.withValues(alpha: 0.75))),
-                      ],
-                    ),
-                  ),
-                  IconButton(
-                    onPressed: () => Navigator.pop(ctx),
-                    icon: Icon(Icons.close, color: accent.withValues(alpha: 0.7)),
-                  ),
-                ],
-              ),
-            ),
-            // Body
-            Flexible(
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.fromLTRB(20, 18, 20, 8),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: children,
-                ),
-              ),
-            ),
-            // Actions
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 8, 20, 18),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: AppButton.neutral('Batal',
-                        onPressed: () => Navigator.pop(ctx)),
-                  ),
-                  const SizedBox(width: AppSpacing.sm),
-                  Expanded(
-                    flex: 2,
-                    child: AppButton(
-                      label: primaryLabel,
-                      icon: primaryIcon,
-                      accent: accent,
-                      onPressed: onPrimary,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  /// Kartu ringkasan order: meja, jumlah item, daftar item ringkas, subtotal.
-  Widget _orderSummaryCard({
-    required Order order,
-    required List<OrderItem> items,
-    required Color accent,
-    required Color accentBg,
-    required Color accentBorder,
-  }) {
-    final subtotal = items.fold<double>(0, (s, i) => s + i.subtotal);
-    final itemCount = items.fold<int>(0, (s, i) => s + i.qty);
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: accentBg,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: accentBorder),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                decoration: BoxDecoration(
-                  color: accent,
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Text('Meja ${order.tableNumber}',
-                    style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 13,
-                        fontWeight: FontWeight.bold)),
-              ),
-              const SizedBox(width: 10),
-              Text('$itemCount item',
-                  style: const TextStyle(
-                      fontSize: 13,
-                      color: AppColors.textSecondary,
-                      fontWeight: FontWeight.w500)),
-              if (order.customerName != null &&
-                  order.customerName!.isNotEmpty) ...[
-                const Text(' • ',
-                    style: TextStyle(color: AppColors.textTertiary)),
-                Flexible(
-                  child: Text(order.customerName!,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                          fontSize: 13, color: AppColors.textSecondary)),
-                ),
-              ],
-            ],
-          ),
-          const SizedBox(height: 10),
-          // Daftar item ringkas (maks 4 baris, sisanya "+n lainnya")
-          ...items.take(4).map((it) => Padding(
-                padding: const EdgeInsets.symmetric(vertical: 2),
-                child: Row(
-                  children: [
-                    Text('${it.qty}×',
-                        style: const TextStyle(
-                            fontSize: 13,
-                            fontWeight: FontWeight.bold,
-                            color: AppColors.textSecondary)),
-                    const SizedBox(width: 6),
-                    Expanded(
-                      child: Text(it.productName,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                              fontSize: 13, color: AppColors.textSecondary)),
-                    ),
-                    Text(CurrencyHelper.format(it.subtotal),
-                        style: const TextStyle(
-                            fontSize: 13, color: AppColors.textSecondary)),
-                  ],
-                ),
-              )),
-          if (items.length > 4)
-            Padding(
-              padding: const EdgeInsets.only(top: 2),
-              child: Text('+${items.length - 4} item lainnya',
-                  style: const TextStyle(
-                      fontSize: 12,
-                      fontStyle: FontStyle.italic,
-                      color: AppColors.textTertiary)),
-            ),
-          const Divider(height: 18),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              const Text('Subtotal',
-                  style: TextStyle(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w600,
-                      color: AppColors.textSecondary)),
-              Text(CurrencyHelper.format(subtotal),
-                  style: const TextStyle(
-                      fontSize: 15, fontWeight: FontWeight.bold)),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  /// Dialog diskon: pilih persen/rupiah, isi nilai, lihat pratinjau total baru.
-  void _showDiscountDialog() {
-    final order = _controller.state.currentOrder;
-    if (order == null) return;
-    final items = _controller.state.orderItems;
-    final valueCtrl = TextEditingController();
-    final noteCtrl = TextEditingController();
-    var isPercent = true;
-    String? errorText;
-
-    // Subtotal item (sebelum charge) untuk menghitung pratinjau diskon.
-    final subtotal = items.fold<double>(0, (s, i) => s + i.subtotal);
-
-    showDialog(
-      context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setS) {
-          final raw = valueCtrl.text.replaceAll(RegExp(r'[^\d]'), '');
-          final v = double.tryParse(raw) ?? 0;
-          double discount = isPercent ? subtotal * v / 100 : v;
-          discount = discount.roundToDouble();
-          if (discount > subtotal) discount = subtotal;
-          final newTotal = (subtotal - discount).clamp(0, subtotal).toDouble();
-
-          void applyPercent(int p) {
-            setS(() {
-              isPercent = true;
-              errorText = null;
-              valueCtrl.text = '$p';
-            });
-          }
-
-          return _actionDialogShell(
-            ctx: ctx,
-            accent: AppColors.moduleProduk,
-            accentBg: AppColors.soft(AppColors.moduleProduk, 0.15),
-            icon: Icons.local_offer_outlined,
-            title: 'Diskon',
-            subtitle: 'Potong harga sebelum pembayaran',
-            children: [
-              _orderSummaryCard(
-                order: order,
-                items: items,
-                accent: AppColors.moduleProduk,
-                accentBg: AppColors.soft(AppColors.moduleProduk, 0.10),
-                accentBorder: AppColors.soft(AppColors.moduleProduk, 0.30),
-              ),
-              const SizedBox(height: 16),
-              // Toggle tipe
-              Row(
-                children: [
-                  Expanded(
-                    child: _discountTypeChip('Persen (%)', isPercent, () {
-                      setS(() {
-                        isPercent = true;
-                        errorText = null;
-                        valueCtrl.clear();
-                      });
-                    }),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: _discountTypeChip('Rupiah (Rp)', !isPercent, () {
-                      setS(() {
-                        isPercent = false;
-                        errorText = null;
-                        valueCtrl.clear();
-                      });
-                    }),
-                  ),
-                ],
-              ),
-              // Preset cepat (hanya untuk persen)
-              if (isPercent) ...[
-                const SizedBox(height: 12),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: [5, 10, 15, 20, 25, 50]
-                      .map((p) => _presetChip('$p%', () => applyPercent(p)))
-                      .toList(),
-                ),
-              ],
-              const SizedBox(height: 14),
-              TextField(
-                controller: valueCtrl,
-                autofocus: true,
-                keyboardType: TextInputType.number,
-                inputFormatters: isPercent ? null : [RupiahInputFormatter()],
-                style: const TextStyle(
-                    fontSize: 18, fontWeight: FontWeight.bold),
-                decoration: InputDecoration(
-                  labelText: isPercent ? 'Persentase' : 'Nominal',
-                  prefixText: isPercent ? null : 'Rp ',
-                  suffixText: isPercent ? '%' : null,
-                  hintText: isPercent ? 'mis. 10' : '0',
-                  border: const OutlineInputBorder(),
-                  errorText: errorText,
-                ),
-                onChanged: (_) => setS(() => errorText = null),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: noteCtrl,
-                textCapitalization: TextCapitalization.words,
-                textInputAction: TextInputAction.done,
-                decoration: const InputDecoration(
-                  labelText: 'Catatan diskon (opsional)',
-                  hintText: 'Contoh: member, promo, karyawan',
-                  prefixIcon: Icon(Icons.label_outline, size: 20),
-                  border: OutlineInputBorder(),
-                ),
-              ),
-              const SizedBox(height: 16),
-              // Pratinjau
-              Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                decoration: BoxDecoration(
-                  color: AppColors.surfaceAlt,
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: AppColors.border),
-                ),
-                child: Column(
-                  children: [
-                    _discountPreviewRow(
-                        'Subtotal', CurrencyHelper.format(subtotal)),
-                    const SizedBox(height: 6),
-                    _discountPreviewRow(
-                      isPercent && v > 0 ? 'Diskon (${v.toStringAsFixed(0)}%)' : 'Diskon',
-                      '- ${CurrencyHelper.format(discount)}',
-                      color: AppColors.danger,
-                    ),
-                    const Divider(height: 18),
-                    _discountPreviewRow(
-                      'Total Baru',
-                      CurrencyHelper.format(newTotal),
-                      bold: true,
-                      color: AppColors.moduleKasir,
-                    ),
-                  ],
-                ),
-              ),
-            ],
-            primaryLabel: 'Terapkan',
-            primaryIcon: Icons.check,
-            onPrimary: () async {
-              if (v <= 0) {
-                setS(() => errorText = 'Nilai diskon harus lebih dari 0');
-                return;
-              }
-              if (isPercent && v > 100) {
-                setS(() => errorText = 'Persentase tidak boleh > 100');
-                return;
-              }
-              final ok = await _controller.applyDiscountToCurrentOrder(
-                chargeType: isPercent ? 'percentage' : 'fixed',
-                value: v,
-                note: noteCtrl.text.trim(),
-              );
-              if (!ctx.mounted) return;
-              if (ok) {
-                Navigator.pop(ctx);
-                if (!mounted) return;
-                showAppSnack(context,
-                    'Diskon ${CurrencyHelper.format(discount)} diterapkan',
-                    icon: Icons.local_offer_outlined);
-              } else {
-                setS(() => errorText = _controller.state.errorMessage ??
-                    'Gagal menerapkan diskon');
-              }
-            },
-          );
-        },
-      ),
-    );
-  }
-
-  Widget _presetChip(String label, VoidCallback onTap) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
-        constraints: const BoxConstraints(minHeight: 44),
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: AppColors.soft(AppColors.moduleProduk, 0.10),
-          borderRadius: BorderRadius.circular(20),
-          border: Border.all(color: AppColors.soft(AppColors.moduleProduk, 0.30)),
-        ),
-        child: Text(label,
-            style: const TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.bold,
-                color: AppColors.moduleProduk)),
-      ),
-    );
-  }
-
-  Widget _discountTypeChip(String label, bool selected, VoidCallback onTap) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 12),
-        alignment: Alignment.center,
-        constraints: const BoxConstraints(minHeight: 44),
-        decoration: BoxDecoration(
-          color: selected ? AppColors.moduleProduk : AppColors.surfaceMuted,
-          borderRadius: BorderRadius.circular(10),
-        ),
-        child: Text(label,
-            style: TextStyle(
-              fontSize: 14,
-              fontWeight: FontWeight.w600,
-              color: selected ? Colors.white : AppColors.textSecondary,
-            )),
-      ),
-    );
-  }
-
-  Widget _discountPreviewRow(String label, String value,
-      {bool bold = false, Color? color}) {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-      children: [
-        Text(label,
-            style: TextStyle(
-                fontSize: 13,
-                color: AppColors.textSecondary,
-                fontWeight: bold ? FontWeight.bold : FontWeight.normal)),
-        Text(value,
-            style: TextStyle(
-                fontSize: bold ? 16 : 13,
-                fontWeight: bold ? FontWeight.bold : FontWeight.w500,
-                color: color ?? AppColors.textPrimary)),
-      ],
-    );
-  }
-
   static String _rupiahFormat(String raw) {
     final digits = raw.replaceAll(RegExp(r'[^\d]'), '');
     if (digits.isEmpty) return '';
@@ -900,14 +326,19 @@ class _CashierScreenState extends State<CashierScreen> {
   }
 
   Future<void> _showTableSelector() async {
-    final table = await showDialog<RestaurantTable>(
+    final tables = _controller.state.tables;
+    final number = await showDialog<String>(
       context: context,
-      builder: (_) => _TablePickerDialog(
-        tables: _controller.state.tables,
+      builder: (_) => CashierTablePickerDialog(
+        tables: tables
+            .map((t) => CashierPickerTable(
+                number: t.tableNumber, available: t.status == 'available'))
+            .toList(),
         selectedNumber: _controller.state.selectedTable?.tableNumber,
       ),
     );
-    if (table == null || !mounted) return;
+    if (number == null || !mounted) return;
+    final table = tables.firstWhere((t) => t.tableNumber == number);
     if (table.status == 'available') {
       // Pesanan baru → input pax (wajib) + identitas customer (opsional).
       final res = await showPaxDialog(context);
@@ -927,35 +358,49 @@ class _CashierScreenState extends State<CashierScreen> {
     final r = await showReservationPicker(context);
     if (r == null || !mounted) return;
 
-    final available = _controller.state.tables
-        .where((t) => t.status == 'available')
-        .toList();
-    if (available.isEmpty) {
-      showAppSnack(context, 'Tidak ada meja kosong untuk reservasi ini',
-          isError: true);
-      return;
-    }
-    final table = await showDialog<RestaurantTable>(
-      context: context,
-      builder: (_) => _TablePickerDialog(tables: available),
-    );
-    if (table == null || !mounted) return;
-
-    final cashierName = _controller.state.activeShift?.openedBy ?? 'Kasir';
     try {
+      // Reservasi yang sudah dibuka kembali ke meja aslinya, termasuk untuk
+      // mengambil tambahan DP. Tidak perlu tersedia meja kosong lainnya.
+      final existing = await OrderRepository().getOrderByReservation(r.id);
+      if (!mounted) return;
+      String tableNumber;
+      if (existing != null) {
+        tableNumber = existing.tableNumber;
+      } else {
+        final available = _controller.state.tables
+            .where((t) => t.status == 'available')
+            .toList();
+        if (available.isEmpty) {
+          showAppSnack(context, 'Tidak ada meja kosong untuk reservasi ini',
+              isError: true);
+          return;
+        }
+        final number = await showDialog<String>(
+          context: context,
+          builder: (_) => CashierTablePickerDialog(
+            tables: available
+                .map((t) => CashierPickerTable(
+                    number: t.tableNumber, available: true))
+                .toList(),
+          ),
+        );
+        if (number == null || !mounted) return;
+        tableNumber = number;
+      }
+
+      final cashierName = _controller.state.activeShift?.openedBy ?? 'Kasir';
       final opened = await ReservationService.instance.openAsOrder(
         reservation: r,
-        tableNumber: table.tableNumber,
+        tableNumber: tableNumber,
         cashierName: cashierName,
       );
       if (!mounted) return;
       await _controller.loadData();
-      final refreshed = _controller.state.tables.firstWhere(
-        (t) => t.tableNumber == table.tableNumber,
-        orElse: () => table,
-      );
-      _controller.selectTable(refreshed);
-      await _controller.loadOrderForTable(table.tableNumber);
+      final actualTable = opened.order.tableNumber;
+      final matching = _controller.state.tables
+          .where((t) => t.tableNumber == actualTable);
+      if (matching.isNotEmpty) _controller.selectTable(matching.first);
+      await _controller.loadOrderForTable(actualTable);
       if (!mounted) return;
       final dp = opened.order.paidAmount > 0
           ? ', DP ${CurrencyHelper.format(opened.order.paidAmount)} tercatat'
@@ -964,7 +409,7 @@ class _CashierScreenState extends State<CashierScreen> {
           ? ''
           : '. Menu tak dikenal POS dilewati: ${opened.skipped.join(', ')}';
       showAppSnack(context,
-          'Reservasi ${r.customerName} dibuka di Meja ${table.tableNumber}$dp$skipped',
+          'Reservasi ${r.customerName} dibuka di Meja $actualTable$dp$skipped',
           isError: opened.skipped.isNotEmpty);
     } catch (e) {
       if (!mounted) return;
@@ -1141,9 +586,46 @@ class _CashierScreenState extends State<CashierScreen> {
 
   // ── Shift Dialogs ────────────────────────────────────────────────────────
 
-  void _showCloseShiftDialog() {
+  Future<void> _showCloseShiftDialog() async {
     final shift = _controller.state.activeShift;
     if (shift == null) return;
+
+    // Tagihan berjalan harus lunas dulu — dicegah SEBELUM dialog tutup kasir
+    // dibuka supaya kasir tak mengisi setoran lalu ditolak di akhir.
+    final unpaid = await _controller.unpaidTables();
+    if (!mounted) return;
+    if (unpaid.isNotEmpty) {
+      await showAppModal<void>(
+        context,
+        title: 'Belum Bisa Tutup Kasir',
+        icon: Icons.receipt_long_rounded,
+        accent: AppColors.warning,
+        scrollable: false,
+        maxWidth: 440,
+        builder: (ctx) => Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              '${CashierRepository.unpaidBlockMessage(unpaid)}\n\n'
+              'Selesaikan pembayarannya dulu lewat layar Kasir atau menu '
+              'Transaksi. Item di Meja Titipan bisa ditarik ke tagihan lewat '
+              '"Tarik dari Titipan". Setelah semuanya selesai, tutup kasir lagi.',
+              style: AppType.body.copyWith(color: AppColors.textSecondary),
+            ),
+            const SizedBox(height: AppSpacing.lg),
+            AppButton(
+              label: 'Mengerti',
+              accent: AppColors.moduleKasir,
+              onPressed: () => Navigator.of(ctx).pop(),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
+
+    if (!mounted) return;
     showDialog(
       context: context,
       barrierDismissible: false,
@@ -1160,70 +642,141 @@ class _CashierScreenState extends State<CashierScreen> {
   }
 
   // Satu container group dengan border
-  Widget _headerGroup(List<Widget> children) {
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(12),
-      child: Container(
-        decoration: BoxDecoration(
-          color: Colors.white.withValues(alpha: 0.15),
-          borderRadius: BorderRadius.circular(12),
-        ),
-        child: IntrinsicHeight(
-          child: Row(mainAxisSize: MainAxisSize.min, children: children),
-        ),
-      ),
-    );
-  }
-
   // Tombol di dalam group
   // Ukuran tombol aksi header — SERAGAM & sebesar jari (target sentuh ~84×60).
-  static const double _headerBtnW = 84;
-  static const double _headerBtnH = 60;
+  static const double _headerBtnW = kCashierHeaderBtnW;
+  static const double _headerBtnH = kCashierHeaderBtnH;
 
   // Ukuran efektif tombol header — dikecilkan di HP agar header tak overflow.
   // Diset di awal [_buildHeader] berdasar lebar layar; default = ukuran tablet.
   double _hbW = _headerBtnW;
   double _hbH = _headerBtnH;
 
+  /// Buka laci kasir MANUAL (mis. tukar uang / laci tak terbuka saat bayar).
+  /// Sengaja tidak menghiraukan sakelar "otomatis" di Pengaturan: ini aksi
+  /// eksplisit kasir, bukan otomatisasi.
+  Future<void> _openCashDrawer() async {
+    try {
+      await CashDrawerService.instance.open();
+      if (mounted) showAppSnack(context, 'Laci kasir dibuka');
+    } catch (e) {
+      if (mounted) {
+        showAppSnack(
+            context,
+            'Gagal buka laci: '
+            '${e.toString().replaceFirst('Exception: ', '')}',
+            isError: true);
+      }
+    }
+  }
+
+  /// Isi bingkai header — urutan & warna tombolnya jadi acuan Kasir Station.
+  List<Widget> _headerActions(CashierState state, double w) => [
+        _syncButton(width: w),
+        _groupDivider(),
+        _headerBtn(
+          icon: Icons.table_restaurant_outlined,
+          label: state.currentOrder != null
+              ? 'Meja ${state.currentOrder!.tableNumber}'
+              : state.selectedTable != null
+                  ? 'Meja ${state.selectedTable!.tableNumber}'
+                  : 'Pilih Meja',
+          onTap: _showTableSelector,
+          width: w,
+        ),
+        _groupDivider(),
+        _headerBtn(
+          icon: Icons.event_seat_outlined,
+          label: 'Reservasi',
+          onTap: _showReservations,
+          width: w,
+        ),
+        _groupDivider(),
+        _headerBtn(
+            icon: Icons.people_alt_outlined,
+            label: 'Ganti Shift',
+            onTap: _showSwapShiftDialog,
+            width: w),
+        _groupDivider(),
+        _headerBtn(
+            icon: Icons.account_balance_wallet_outlined,
+            label: 'Kas',
+            onTap: () => _showCashMovementDialog('in'),
+            width: w),
+        _groupDivider(),
+        _headerBtn(
+            icon: Icons.point_of_sale_outlined,
+            label: 'Buka Laci',
+            onTap: _openCashDrawer,
+            width: w),
+        _groupDivider(),
+        _headerBtn(
+            icon: Icons.history,
+            label: 'Riwayat',
+            onTap: _showMovementsHistory,
+            width: w),
+        _groupDivider(),
+        _headerBtn(
+            icon: Icons.remove_shopping_cart_outlined,
+            label: 'Void',
+            onTap: _showVoidTransactionPicker,
+            iconColor: AppColors.danger,
+            width: w),
+        _groupDivider(),
+        _headerBtn(
+            icon: Icons.history_toggle_off,
+            label: 'Histori Void',
+            onTap: _showVoidHistory,
+            iconColor: AppColors.danger,
+            width: w),
+        _groupDivider(),
+        _headerBtn(
+            icon: Icons.print_outlined,
+            label: 'Cetak Ulang',
+            onTap: _showReprintPicker,
+            width: w),
+        _groupDivider(),
+        CashierHeaderButton(
+          icon: Icons.refresh,
+          label: 'Muat Ulang',
+          onTap: () => _controller.loadData(),
+          background: Colors.white,
+          iconColor: AppColors.moduleKasir,
+          width: w,
+          height: _hbH,
+        ),
+        _groupDivider(),
+        CashierHeaderButton(
+          icon: Icons.logout,
+          label: 'Tutup Kasir',
+          onTap: _showCloseShiftDialog,
+          background: AppColors.danger,
+          iconColor: Colors.white,
+          width: w,
+          height: _hbH,
+        ),
+      ];
+
   Widget _headerBtn({
     required IconData icon,
     required String label,
     required VoidCallback onTap,
     Color? iconColor,
+    double? width,
   }) {
-    return InkWell(
+    return CashierHeaderButton(
+      icon: icon,
+      label: label,
       onTap: onTap,
-      borderRadius: BorderRadius.circular(10),
-      child: SizedBox(
-        width: _hbW,
-        height: _hbH,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(icon, color: iconColor ?? Colors.white, size: 22),
-            const SizedBox(height: 4),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 3),
-              child: Text(label,
-                  textAlign: TextAlign.center,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    color: iconColor ?? Colors.white,
-                    fontSize: 11,
-                    fontWeight: FontWeight.w600,
-                  )),
-            ),
-          ],
-        ),
-      ),
+      iconColor: iconColor,
+      width: width ?? _hbW,
+      height: _hbH,
     );
   }
 
   /// Tombol Sinkron di header (ukuran seragam 84×60): status + tap untuk
   /// sinkron ke cloud, dengan animasi berputar saat proses.
-  Widget _syncButton() {
+  Widget _syncButton({double? width}) {
     // Dengarkan status siklus dari service (true saat auto-sync timer maupun
     // manual) agar tombol ikut berputar walau sync dipicu otomatis.
     return ValueListenableBuilder<bool>(
@@ -1234,7 +787,7 @@ class _CashierScreenState extends State<CashierScreen> {
           syncing: syncing,
           status: s,
           onTap: _doSync,
-          width: _hbW,
+          width: width ?? _hbW,
           height: _hbH,
         ),
       ),
@@ -1275,10 +828,7 @@ class _CashierScreenState extends State<CashierScreen> {
   }
 
   // Separator tipis di dalam group
-  Widget _groupDivider() => Container(
-        width: 1,
-        color: Colors.white.withValues(alpha: 0.2),
-      );
+  Widget _groupDivider() => cashierGroupDivider();
 
   void _showMovementsHistory() {
     showDialog(
@@ -1646,7 +1196,7 @@ class _CashierScreenState extends State<CashierScreen> {
         final product = state.productCache[entry.key];
         if (product == null) return const SizedBox.shrink();
         final addons = state.cartAddons[entry.key] ?? const <SelectedAddon>[];
-        return _CartItemTile(
+        return CashierCartItemTile(
           name: product.name,
           qty: entry.value,
           // Harga baris = harga menu + add-on, sama dengan yang nanti disimpan
@@ -1672,14 +1222,14 @@ class _CashierScreenState extends State<CashierScreen> {
                   color: AppColors.textTertiary,
                   fontSize: 12)),
         ),
-        ...state.orderItems.map((item) => _CartItemTile(
+        ...state.orderItems.map((item) => CashierCartItemTile(
               name: item.productName,
               qty: item.qty,
               price: item.price,
               status: item.itemStatus,
               addonLabel: item.addonLabel,
               notes: item.notes.isEmpty ? null : item.notes,
-              onDelete: () => _showItemDeleteOptions(item),
+              onDelete: () => showItemDeleteOptions(item),
             )),
       ],
     ];
@@ -1729,140 +1279,29 @@ class _CashierScreenState extends State<CashierScreen> {
                 ),
                 SizedBox(width: edgeGap),
 
-                // ── Tombol Sinkron: status + tap untuk sinkron ke cloud ──
-                _syncButton(),
-
-                // ── Grup tombol — mulai dari kiri, scroll bila layar sempit ──
+                // ── SATU bingkai untuk semua tombol aksi ────────────────────
+                // Sebelumnya tombol terpecah jadi beberapa grup + dua tombol
+                // lepas di kanan; kini semuanya duduk dalam satu bingkai
+                // bersambung yang dipisah garis tipis, warna tiap tombol tetap
+                // (Void merah, Muat Ulang putih, Tutup Kasir merah).
                 Expanded(
-                  child: SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: Row(
-                      children: [
-                        _headerGroup([
-                          _headerBtn(
-                            icon: Icons.table_restaurant_outlined,
-                            label: state.currentOrder != null
-                                ? 'Meja ${state.currentOrder!.tableNumber}'
-                                : state.selectedTable != null
-                                    ? 'Meja ${state.selectedTable!.tableNumber}'
-                                    : 'Pilih Meja',
-                            onTap: _showTableSelector,
-                          ),
-                          _groupDivider(),
-                          _headerBtn(
-                            icon: Icons.event_seat_outlined,
-                            label: 'Reservasi',
-                            onTap: _showReservations,
-                          ),
-                        ]),
-                        const SizedBox(width: 10),
-                        _headerGroup([
-                          _headerBtn(
-                              icon: Icons.swap_horiz,
-                              label: 'Ganti Shift',
-                              onTap: _showSwapShiftDialog),
-                        ]),
-                        const SizedBox(width: 10),
-                        _headerGroup([
-                          _headerBtn(
-                              icon: Icons.account_balance_wallet_outlined,
-                              label: 'Kas',
-                              onTap: () => _showCashMovementDialog('in')),
-                          _groupDivider(),
-                          _headerBtn(
-                              icon: Icons.history,
-                              label: 'Riwayat',
-                              onTap: _showMovementsHistory),
-                          _groupDivider(),
-                          _headerBtn(
-                              icon: Icons.remove_shopping_cart_outlined,
-                              label: 'Void',
-                              onTap: _showVoidTransactionPicker,
-                              iconColor: AppColors.danger),
-                          _groupDivider(),
-                          _headerBtn(
-                              icon: Icons.history_toggle_off,
-                              label: 'Histori Void',
-                              onTap: _showVoidHistory,
-                              iconColor: AppColors.danger),
-                          _groupDivider(),
-                          _headerBtn(
-                              icon: Icons.print_outlined,
-                              label: 'Cetak Ulang',
-                              onTap: _showReprintPicker),
-                        ]),
-                      ],
-                    ),
-                  ),
-                ),
-
-                SizedBox(width: edgeGap),
-
-                // ── Refresh (ukuran seragam, mengecil di HP) ──
-                Material(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(12),
-                  child: InkWell(
-                    borderRadius: BorderRadius.circular(12),
-                    onTap: () => _controller.loadData(),
-                    child: SizedBox(
-                      width: _hbW,
-                      height: _hbH,
-                      child: const Column(
-                        mainAxisSize: MainAxisSize.min,
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Icon(Icons.refresh,
-                              color: AppColors.moduleKasir, size: 22),
-                          SizedBox(height: 4),
-                          Text('Muat Ulang',
-                              textAlign: TextAlign.center,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                color: AppColors.moduleKasir,
-                                fontSize: 11,
-                                fontWeight: FontWeight.w600,
-                              )),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-
-                SizedBox(width: edgeGap),
-
-                // ── Tutup Kasir (paling ujung, merah) — mengecil di HP ──
-                Material(
-                  color: AppColors.danger,
-                  borderRadius: BorderRadius.circular(12),
-                  child: InkWell(
-                    borderRadius: BorderRadius.circular(12),
-                    onTap: _showCloseShiftDialog,
-                    child: SizedBox(
-                      width: _hbW,
-                      height: _hbH,
-                      child: const Column(
-                        mainAxisSize: MainAxisSize.min,
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Icon(Icons.logout, color: Colors.white, size: 22),
-                          SizedBox(height: 4),
-                          Padding(
-                            padding: EdgeInsets.symmetric(horizontal: 3),
-                            child: Text('Tutup Kasir',
-                                textAlign: TextAlign.center,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w600,
-                                )),
-                          ),
-                        ],
-                      ),
-                    ),
+                  child: LayoutBuilder(
+                    builder: (context, c) {
+                      // Bingkai memenuhi lebar bila muat (rapi, tanpa sisa
+                      // ruang di kanan); bila sempit (HP) baru bisa digulir.
+                      const count = 12; // sinkron, meja, reservasi, dan aksi kasir
+                      const dividers = count - 1;
+                      final natural = _hbW * count + dividers;
+                      final fits = c.maxWidth >= natural;
+                      final w = fits ? (c.maxWidth - dividers) / count : _hbW;
+                      final frame =
+                          cashierHeaderGroup(_headerActions(state, w));
+                      if (fits) return frame;
+                      return SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        child: frame,
+                      );
+                    },
                   ),
                 ),
               ],
@@ -1925,7 +1364,7 @@ class _CashierScreenState extends State<CashierScreen> {
           itemBuilder: (context, index) {
             final product = state.products[index];
             final inCart = state.cart[product.id] ?? 0;
-            return _ProductTile(
+            return CashierProductTile(
               product: product,
               inCart: inCart,
               hasAddons: (state.addonCounts[product.id] ?? 0) > 0,
@@ -2140,7 +1579,7 @@ class _CashierScreenState extends State<CashierScreen> {
                 onTap: _showPaymentDialog,
               ),
               const SizedBox(height: 8),
-              _buildCollapsibleActions(state.isProcessing),
+              buildOrderActionsPanel(state.isProcessing),
             ] else if (state.currentOrder != null &&
                 !state.currentOrder!.isPaid) ...[
               _buildActionButton(
@@ -2149,7 +1588,7 @@ class _CashierScreenState extends State<CashierScreen> {
                 onTap: _showPaymentDialog,
               ),
               const SizedBox(height: 8),
-              _buildCollapsibleActions(state.isProcessing),
+              buildOrderActionsPanel(state.isProcessing),
             ] else if (state.currentOrder == null && state.cart.isNotEmpty)
               _buildActionButton(
                 label: 'BUAT ORDER',
@@ -2189,744 +1628,14 @@ class _CashierScreenState extends State<CashierScreen> {
     required String label,
     required bool isLoading,
     required VoidCallback onTap,
-  }) {
-    return AppButton(
-      label: label,
-      loading: isLoading,
-      onPressed: onTap,
-      accent: AppColors.moduleKasir,
-      size: AppButtonSize.medium,
-    );
-  }
+  }) =>
+      CashierActionButton(label: label, isLoading: isLoading, onTap: onTap);
 
   /// Toggle "Aksi Lainnya": sembunyikan/tampilkan aksi sekunder agar daftar
   /// item tak tertutup di layar kecil. TAMBAH & BAYAR tetap selalu terlihat.
-  Widget _buildCollapsibleActions(bool isLoading) {
-    return Column(
-      children: [
-        Material(
-          color: AppColors.soft(AppColors.accent, 0.10),
-          borderRadius: AppRadius.rMd,
-          child: InkWell(
-            borderRadius: AppRadius.rMd,
-            onTap: () =>
-                setState(() => _showMoreActions = !_showMoreActions),
-            child: Container(
-              height: 44,
-              alignment: Alignment.center,
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(
-                      _showMoreActions
-                          ? Icons.expand_less_rounded
-                          : Icons.expand_more_rounded,
-                      size: 20,
-                      color: AppColors.accentDark),
-                  const SizedBox(width: 6),
-                  Text(_showMoreActions ? 'Sembunyikan aksi' : 'Aksi Lainnya',
-                      style: const TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.w700,
-                          color: AppColors.accentDark)),
-                ],
-              ),
-            ),
-          ),
-        ),
-        if (_showMoreActions) ...[
-          const SizedBox(height: 8),
-          _buildSecondaryActions(isLoading),
-        ],
-      ],
-    );
-  }
 
-  /// Aksi sekunder pada order aktif (Diskon, Kompliment, Split, dll) — gold tonal.
-  Widget _buildSecondaryActions(bool isLoading) {
-    return Column(
-      children: [
-        Row(
-          children: [
-            Expanded(
-              child: _secondaryButton(
-                icon: Icons.local_offer_outlined,
-                label: 'Diskon',
-                color: AppColors.moduleProduk,
-                borderColor: AppColors.soft(AppColors.moduleProduk, 0.40),
-                onTap: isLoading ? null : _showDiscountDialog,
-              ),
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: _secondaryButton(
-                icon: Icons.card_giftcard,
-                label: 'Kompliment',
-                color: AppColors.moduleWaiter,
-                borderColor: AppColors.warning,
-                onTap: isLoading ? null : _showComplimentDialog,
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 8),
-        Row(
-          children: [
-            Expanded(
-              child: _secondaryButton(
-                icon: Icons.call_split,
-                label: 'Split Bill',
-                color: AppColors.moduleProduk,
-                borderColor: AppColors.soft(AppColors.moduleProduk, 0.40),
-                onTap: isLoading ? null : _showSplitBillDialog,
-              ),
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: _secondaryButton(
-                icon: Icons.payments_outlined,
-                label: 'Gabung Bayar',
-                color: AppColors.moduleMeja,
-                borderColor: AppColors.soft(AppColors.moduleMeja, 0.35),
-                onTap: isLoading ? null : _showMixedPaymentDialog,
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 8),
-        Row(
-          children: [
-            Expanded(
-              child: _secondaryButton(
-                icon: Icons.swap_horiz,
-                label: 'Pindah Meja',
-                color: AppColors.info,
-                borderColor: AppColors.soft(AppColors.info, 0.40),
-                onTap: isLoading ? null : _showMovePicker,
-              ),
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: _secondaryButton(
-                icon: Icons.merge_type,
-                label: 'Gabung Meja',
-                color: AppColors.info,
-                borderColor: AppColors.soft(AppColors.info, 0.40),
-                onTap: isLoading ? null : _showMergePicker,
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 8),
-        SizedBox(
-          width: double.infinity,
-          child: _secondaryButton(
-            icon: Icons.inventory_2_outlined,
-            label: 'Tarik dari Titipan',
-            color: AppColors.accent,
-            borderColor: AppColors.soft(AppColors.accent, 0.40),
-            onTap: isLoading ? null : _showHeldItemsPicker,
-          ),
-        ),
-        const SizedBox(height: 8),
-        SizedBox(
-          width: double.infinity,
-          child: _secondaryButton(
-            icon: Icons.receipt_long_outlined,
-            label: 'Cetak Tagihan',
-            color: AppColors.moduleKasir,
-            borderColor: AppColors.soft(AppColors.moduleKasir, 0.40),
-            onTap: isLoading ? null : _printBill,
-          ),
-        ),
-      ],
-    );
-  }
-
-  // ── Pindah Meja ───────────────────────────────────────────────────────────
-  /// Hapus (void) satu item — wajib PIN Manager/SVP (atau PIN void bersama).
-  Future<void> _showItemVoidDialog(OrderItem item) async {
-    final n = await _askUnitQty(item.qty, title: 'Void berapa unit?');
-    if (n == null || !mounted) return;
-    final auth = await showPinAuthDialog(
-      context,
-      title: 'Hapus Item',
-      actionLabel: 'Hapus Item',
-      icon: Icons.delete_outline,
-      details: {
-        'Item': '${n}x ${item.productName}',
-        'Harga': CurrencyHelper.format(item.price * n),
-        if (item.waiterName.isNotEmpty) 'Pemesan': item.waiterName,
-      },
-      reasonHint: 'Contoh: salah input, pelanggan batal',
-    );
-    if (auth == null || !mounted) return;
-    final res = await _controller.voidOrderItem(
-      itemId: item.id,
-      pin: auth.pin,
-      reason: auth.reason,
-      qty: n,
-    );
-    if (!mounted) return;
-    final msg = res == 'ok'
-        ? 'Item dihapus'
-        : res == 'invalid_pin'
-            ? 'PIN salah / tidak berwenang'
-            : (_controller.state.errorMessage ?? 'Gagal hapus item');
-    showAppSnack(context, msg, isError: res != 'ok');
-  }
-
-  /// Aksi hapus item → pilihan: Pindah ke meja lain (transfer) atau Void (hapus).
-  /// Tampilkan modal di TENGAH layar (dialog), bukan meluncur dari bawah.
-  /// Konten [builder] sama seperti bottom-sheet; hanya posisinya dipusatkan.
-  Future<T?> _centeredModal<T>(
-      {required Widget Function(BuildContext) builder}) {
-    return showDialog<T>(
-      context: context,
-      builder: (ctx) => Dialog(
-        backgroundColor: AppColors.surface,
-        insetPadding:
-            const EdgeInsets.symmetric(horizontal: 24, vertical: 32),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        child: ConstrainedBox(
-          constraints: BoxConstraints(
-            maxWidth: 460,
-            maxHeight: MediaQuery.of(ctx).size.height * 0.82,
-          ),
-          child: builder(ctx),
-        ),
-      ),
-    );
-  }
-
-  /// Tanya jumlah unit (1..[maxQty]). null = batal. Bila maxQty ≤ 1, langsung
-  /// kembalikan 1 tanpa dialog (baris qty 1 tak perlu ditanya).
-  Future<int?> _askUnitQty(int maxQty, {String title = 'Berapa unit?'}) async {
-    if (maxQty <= 1) return 1;
-    int qty = maxQty; // default: seluruh baris
-    return showDialog<int>(
-      context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setD) => AlertDialog(
-          shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-          title: Text(title, style: const TextStyle(fontSize: 16)),
-          content: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              IconButton(
-                iconSize: 36,
-                color: AppColors.moduleKasir,
-                icon: const Icon(Icons.remove_circle_outline),
-                onPressed: qty > 1 ? () => setD(() => qty--) : null,
-              ),
-              SizedBox(
-                width: 64,
-                child: Text('$qty',
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(
-                        fontSize: 30, fontWeight: FontWeight.bold)),
-              ),
-              IconButton(
-                iconSize: 36,
-                color: AppColors.moduleKasir,
-                icon: const Icon(Icons.add_circle_outline),
-                onPressed: qty < maxQty ? () => setD(() => qty++) : null,
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-                onPressed: () => Navigator.pop(ctx),
-                child: const Text('Batal')),
-            FilledButton(
-                onPressed: () => Navigator.pop(ctx, qty),
-                child: Text('Pilih $qty dari $maxQty')),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Future<void> _showItemDeleteOptions(OrderItem item) async {
-    final choice = await _centeredModal<String>(
-      builder: (ctx) => Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Text('${item.qty}x ${item.productName}',
-                      style: const TextStyle(
-                          fontSize: 15, fontWeight: FontWeight.w700)),
-                ),
-                Text(CurrencyHelper.format(item.subtotal),
-                    style: const TextStyle(
-                        fontWeight: FontWeight.w700,
-                        color: AppColors.moduleKasir)),
-              ],
-            ),
-          ),
-          const Divider(height: 1, color: AppColors.border),
-          ListTile(
-            leading: const Icon(Icons.swap_horiz_rounded,
-                color: AppColors.moduleKasir),
-            title: const Text('Pindah ke meja lain'),
-            subtitle: const Text(
-                'Item pindah ke order meja aktif lain (tanpa cetak ulang)'),
-            onTap: () => Navigator.pop(ctx, 'move'),
-          ),
-          ListTile(
-            leading: const Icon(Icons.inventory_2_outlined,
-                color: AppColors.accent),
-            title: const Text('Titip ke Meja Titipan'),
-            subtitle: const Text(
-                'Simpan untuk tamu berikutnya — perlu PIN manajer'),
-            onTap: () => Navigator.pop(ctx, 'titip'),
-          ),
-          ListTile(
-            leading:
-                const Icon(Icons.delete_outline, color: AppColors.danger),
-            title: const Text('Void item (hapus)'),
-            subtitle: const Text('Batalkan item — perlu PIN manajer'),
-            onTap: () => Navigator.pop(ctx, 'void'),
-          ),
-          const SizedBox(height: 8),
-        ],
-      ),
-    );
-    if (!mounted || choice == null) return;
-    if (choice == 'void') {
-      await _showItemVoidDialog(item);
-    } else if (choice == 'move') {
-      await _showItemMovePicker(item);
-    } else if (choice == 'titip') {
-      await _titipItem(item);
-    }
-  }
-
-  /// Titip item ke Meja Titipan: peringatan keamanan pangan → PIN manajer → park.
-  Future<void> _titipItem(OrderItem item) async {
-    final n = await _askUnitQty(item.qty, title: 'Titip berapa unit?');
-    if (n == null || !mounted) return;
-    final proceed = await showAppConfirm(
-      context,
-      title: 'Titip ke Meja Titipan?',
-      message: '${n}x ${item.productName} disimpan untuk dijual ke '
-          'tamu berikutnya.\n\n'
-          '⚠️ Pastikan item MASIH LAYAK & AMAN dikonsumsi. Untuk makanan '
-          'matang/minuman terbuka yang sudah lama, sebaiknya Void (waste), '
-          'bukan dititip.',
-      confirmText: 'Lanjut Titip',
-      icon: Icons.inventory_2_outlined,
-    );
-    if (proceed != true || !mounted) return;
-
-    final auth = await showPinAuthDialog(
-      context,
-      title: 'Titip Item',
-      actionLabel: 'Titip Item',
-      icon: Icons.inventory_2_outlined,
-      details: {
-        'Item': '${n}x ${item.productName}',
-        'Harga': CurrencyHelper.format(item.price * n),
-      },
-      reasonHint: 'Contoh: tamu batal, salah antar',
-    );
-    if (auth == null || !mounted) return;
-    final res =
-        await _controller.parkItem(itemId: item.id, pin: auth.pin, qty: n);
-    if (!mounted) return;
-    final msg = res == 'ok'
-        ? 'Item dititip ke Meja Titipan'
-        : res == 'invalid_pin'
-            ? 'PIN salah / tidak berwenang'
-            : (_controller.state.errorMessage ?? 'Gagal titip item');
-    showAppSnack(context, msg, isError: res != 'ok');
-  }
-
-  /// Meja Titipan: ketuk item → tarik ke pesanan saat ini; atau Void (waste)
-  /// item yang sudah tak layak. Menampilkan usia titip (item lama ditandai).
-  Future<void> _showHeldItemsPicker() async {
-    if (_controller.state.currentOrder == null) {
-      showAppSnack(context, 'Buka order/meja dulu untuk menarik titipan',
-          isError: true);
-      return;
-    }
-    var held = await _controller.getHeldItems();
-    if (!mounted) return;
-    if (held.isEmpty) {
-      showAppSnack(context, 'Tidak ada item di Meja Titipan');
-      return;
-    }
-
-    String ageStr(DateTime t) {
-      final d = DateTime.now().difference(t);
-      if (d.inHours >= 1) return '${d.inHours}j ${d.inMinutes % 60}m';
-      if (d.inMinutes >= 1) return '${d.inMinutes} menit';
-      return 'baru saja';
-    }
-
-    await _centeredModal<void>(
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setSheet) {
-          Future<void> reload() async {
-            final fresh = await _controller.getHeldItems();
-            if (ctx.mounted) setSheet(() => held = fresh);
-          }
-
-          return Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Padding(
-                    padding: EdgeInsets.fromLTRB(20, 16, 20, 4),
-                    child: Text('Meja Titipan',
-                        style: TextStyle(
-                            fontSize: 16, fontWeight: FontWeight.bold)),
-                  ),
-                  const Padding(
-                    padding: EdgeInsets.fromLTRB(20, 0, 20, 8),
-                    child: Text(
-                        'Ketuk untuk tarik ke pesanan. Item lama bisa di-Void (waste).',
-                        style: TextStyle(
-                            fontSize: 12, color: AppColors.textTertiary)),
-                  ),
-                  const Divider(height: 1, color: AppColors.border),
-                  if (held.isEmpty)
-                    const Padding(
-                      padding: EdgeInsets.all(28),
-                      child: Center(
-                        child: Text('Titipan kosong',
-                            style:
-                                TextStyle(color: AppColors.textTertiary)),
-                      ),
-                    )
-                  else
-                    Flexible(
-                      child: ListView.separated(
-                        padding: const EdgeInsets.all(12),
-                        itemCount: held.length,
-                        separatorBuilder: (_, __) =>
-                            const SizedBox(height: 8),
-                        itemBuilder: (_, i) {
-                          final it = held[i];
-                          final stale = DateTime.now()
-                                  .difference(it.updatedAt)
-                                  .inHours >=
-                              4;
-                          return Material(
-                            color: AppColors.surfaceMuted,
-                            borderRadius: BorderRadius.circular(12),
-                            child: Row(
-                              children: [
-                                Expanded(
-                                  child: InkWell(
-                                    borderRadius: BorderRadius.circular(12),
-                                    onTap: () async {
-                                      final n = await _askUnitQty(it.qty,
-                                          title: 'Tarik berapa unit?');
-                                      if (n == null || !mounted) return;
-                                      final res = await _controller
-                                          .pullHeldItem(it.id, qty: n);
-                                      if (!mounted) return;
-                                      showAppSnack(
-                                        context,
-                                        res == 'ok'
-                                            ? 'Titipan ditarik ke pesanan'
-                                            : (_controller
-                                                    .state.errorMessage ??
-                                                'Gagal tarik titipan'),
-                                        isError: res != 'ok',
-                                      );
-                                      if (res == 'ok') await reload();
-                                    },
-                                    child: Padding(
-                                      padding: const EdgeInsets.fromLTRB(
-                                          12, 10, 4, 10),
-                                      child: Column(
-                                        crossAxisAlignment:
-                                            CrossAxisAlignment.start,
-                                        children: [
-                                          Text('${it.qty}x ${it.productName}',
-                                              style: const TextStyle(
-                                                  fontWeight:
-                                                      FontWeight.w600)),
-                                          const SizedBox(height: 3),
-                                          Row(children: [
-                                            Icon(
-                                                stale
-                                                    ? Icons
-                                                        .warning_amber_rounded
-                                                    : Icons.schedule_rounded,
-                                                size: 12,
-                                                color: stale
-                                                    ? AppColors.warning
-                                                    : AppColors.textTertiary),
-                                            const SizedBox(width: 4),
-                                            Text(
-                                                'dititip ${ageStr(it.updatedAt)} lalu',
-                                                style: TextStyle(
-                                                    fontSize: 11,
-                                                    color: stale
-                                                        ? AppColors.warning
-                                                        : AppColors
-                                                            .textTertiary)),
-                                            const SizedBox(width: 8),
-                                            Text(
-                                                CurrencyHelper.format(
-                                                    it.subtotal),
-                                                style: const TextStyle(
-                                                    fontSize: 11,
-                                                    fontWeight:
-                                                        FontWeight.w700,
-                                                    color: AppColors
-                                                        .moduleKasir)),
-                                          ]),
-                                        ],
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                                IconButton(
-                                  tooltip: 'Void (waste)',
-                                  icon: const Icon(Icons.delete_outline,
-                                      color: AppColors.danger),
-                                  onPressed: () async {
-                                    final n = await _askUnitQty(it.qty,
-                                        title: 'Void berapa unit?');
-                                    if (n == null || !mounted) return;
-                                    final auth = await showPinAuthDialog(
-                                      context,
-                                      title: 'Void Titipan',
-                                      actionLabel: 'Void (Waste)',
-                                      icon: Icons.delete_outline,
-                                      details: {
-                                        'Item': '${n}x ${it.productName}',
-                                        'Harga': CurrencyHelper.format(
-                                            it.price * n),
-                                      },
-                                      reasonHint:
-                                          'Contoh: sudah tidak layak, kadaluarsa',
-                                    );
-                                    if (auth == null || !mounted) return;
-                                    final res = await _controller.voidHeldItem(
-                                        itemId: it.id,
-                                        pin: auth.pin,
-                                        reason: auth.reason,
-                                        qty: n);
-                                    if (!mounted) return;
-                                    showAppSnack(
-                                        context,
-                                        res == 'ok'
-                                            ? 'Titipan di-void (waste)'
-                                            : res == 'invalid_pin'
-                                                ? 'PIN salah / tidak berwenang'
-                                                : 'Gagal void titipan',
-                                        isError: res != 'ok');
-                                    if (res == 'ok') await reload();
-                                  },
-                                ),
-                              ],
-                            ),
-                          );
-                        },
-                      ),
-                    ),
-                  const SizedBox(height: 8),
-                ],
-              );
-        },
-      ),
-    );
-  }
-
-  /// Pindahkan satu item ke order aktif di meja lain (Fase 1).
-  Future<void> _showItemMovePicker(OrderItem item) async {
-    final order = _controller.state.currentOrder;
-    if (order == null) return;
-    final n = await _askUnitQty(item.qty, title: 'Pindah berapa unit?');
-    if (n == null || !mounted) return;
-    showDialog(
-      context: context,
-      builder: (ctx) => _MergePicker(
-        getOrders: _controller.getMoveTargets,
-        targetTable: order.tableNumber,
-        title: 'Pindah item ke Meja:',
-        headerIcon: Icons.swap_horiz_rounded,
-        onPick: (dest) async {
-          Navigator.pop(ctx);
-          final res = await _controller.moveItemToTable(
-            itemId: item.id,
-            targetOrderId: dest.id,
-            qty: n,
-          );
-          if (!mounted) return;
-          showAppSnack(
-            context,
-            res == 'ok'
-                ? 'Item dipindah ke Meja ${dest.tableNumber}'
-                : (_controller.state.errorMessage ?? 'Gagal pindah item'),
-            isError: res != 'ok',
-          );
-        },
-      ),
-    );
-  }
-
-  void _showMovePicker() {
-    final order = _controller.state.currentOrder;
-    if (order == null) return;
-    final available = _controller.state.tables
-        .where((t) => t.status == 'available')
-        .toList();
-    _centeredModal<void>(
-      builder: (ctx) => Padding(
-            padding: const EdgeInsets.all(20),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text('Pindah dari Meja ${order.tableNumber} ke:',
-                    style: const TextStyle(
-                        fontSize: 16, fontWeight: FontWeight.bold)),
-                const SizedBox(height: 16),
-                if (available.isEmpty)
-                  const Text('Tidak ada meja kosong',
-                      style: TextStyle(color: AppColors.textTertiary))
-                else
-                  Flexible(
-                    child: SingleChildScrollView(
-                      child: Wrap(
-                        spacing: 10,
-                        runSpacing: 10,
-                        children: available
-                      .map((t) => Material(
-                            color: AppColors.surfaceMuted,
-                            borderRadius: BorderRadius.circular(12),
-                            child: InkWell(
-                              borderRadius: BorderRadius.circular(12),
-                              onTap: () async {
-                                Navigator.pop(ctx);
-                                final ok = await _controller
-                                    .moveOrderToTable(t.tableNumber);
-                                if (!mounted) return;
-                                showAppSnack(
-                                    context,
-                                    ok
-                                        ? 'Pindah ke Meja ${t.tableNumber}'
-                                        : _controller.state.errorMessage ??
-                                            'Gagal pindah',
-                                    isError: !ok);
-                              },
-                              child: Container(
-                                width: 72,
-                                height: 56,
-                                alignment: Alignment.center,
-                                child: Text(t.tableNumber,
-                                    style: const TextStyle(
-                                        fontSize: 16,
-                                        fontWeight: FontWeight.bold)),
-                              ),
-                            ),
-                          ))
-                            .toList(),
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-          ),
-    );
-  }
-
-  // ── Gabung Meja ───────────────────────────────────────────────────────────
-  void _showMergePicker() {
-    final order = _controller.state.currentOrder;
-    if (order == null) return;
-    showDialog(
-      context: context,
-      builder: (ctx) => _MergePicker(
-        getOrders: _controller.getMergeableOrders,
-        targetTable: order.tableNumber,
-        onPick: (src) async {
-          Navigator.pop(ctx);
-          final ok = await _controller.mergeTable(src.id);
-          if (!mounted) return;
-          showAppSnack(
-              context,
-              ok
-                  ? 'Meja ${src.tableNumber} digabung ke ${order.tableNumber}'
-                  : _controller.state.errorMessage ?? 'Gagal gabung',
-              isError: !ok);
-        },
-      ),
-    );
-  }
-
-  // ── Gabung Pembayaran (campur metode) ─────────────────────────────────────
-  void _showMixedPaymentDialog() {
-    if (_controller.state.currentOrder == null) return;
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) => _MixedPaymentDialog(controller: _controller),
-    );
-  }
-
-  Future<void> _printBill() async {
-    final ok = await _controller.printCurrentBill();
-    if (!mounted) return;
-    showAppSnack(context, ok ? 'Tagihan dicetak' : 'Tidak ada order aktif',
-        isError: !ok, icon: ok ? Icons.receipt_long_outlined : null);
-  }
-
-  Widget _secondaryButton({
-    required IconData icon,
-    required String label,
-    required Color color,
-    required Color borderColor,
-    required VoidCallback? onTap,
-  }) {
-    return AppButton(
-      label: label,
-      icon: icon,
-      onPressed: onTap,
-      variant: AppButtonVariant.tonal,
-      // SECONDARY gold tonal untuk seluruh aksi sekunder (bukan CTA bayar).
-      accent: AppColors.accent,
-      size: AppButtonSize.medium,
-    );
-  }
-
-  Widget _categoryChip(String label, bool selected, VoidCallback onTap) {
-    return Padding(
-      padding: const EdgeInsets.only(right: AppSpacing.xs),
-      child: Material(
-        // SECONDARY gold untuk kategori terpilih (identitas hijau+emas).
-        color: selected ? AppColors.accent : AppColors.surfaceMuted,
-        borderRadius: AppRadius.rPill,
-        child: InkWell(
-          borderRadius: AppRadius.rPill,
-          onTap: onTap,
-          child: Container(
-            padding: const EdgeInsets.symmetric(
-                horizontal: AppSpacing.md, vertical: AppSpacing.xs),
-            constraints: const BoxConstraints(minHeight: 44),
-            alignment: Alignment.center,
-            child: Text(
-              label,
-              style: AppType.label.copyWith(
-                color: selected ? Colors.white : AppColors.textSecondary,
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
+  Widget _categoryChip(String label, bool selected, VoidCallback onTap) =>
+      CashierCategoryChip(label: label, selected: selected, onTap: onTap);
 }
 
 // ─── Widgets ─────────────────────────────────────────────────────────────────
@@ -3018,10 +1727,9 @@ class _SyncButtonState extends State<_SyncButton>
     return Opacity(
       opacity: disabled ? 0.55 : 1,
       child: Material(
-        color: Colors.white.withValues(alpha: disabled ? 0.06 : 0.15),
-        borderRadius: BorderRadius.circular(12),
+        // Duduk di dalam bingkai header bersama → tanpa latar & sudut sendiri.
+        color: Colors.transparent,
         child: InkWell(
-          borderRadius: BorderRadius.circular(12),
           // Nonaktif → tetap bisa ditekan agar memunculkan petunjuk aktivasi,
           // tapi tampil redup. Saat sedang sinkron → tidak bisa ditekan.
           onTap: widget.syncing ? null : widget.onTap,
@@ -3057,345 +1765,6 @@ class _SyncButtonState extends State<_SyncButton>
     );
   }
 }
-
-class _ProductTile extends StatelessWidget {
-  final Product product;
-  final int inCart;
-
-  /// Menu ini punya add-on — ditandai agar kasir tahu sebelum menekan bahwa
-  /// akan muncul dialog pilihan tambahan.
-  final bool hasAddons;
-  final VoidCallback onTap;
-
-  const _ProductTile({
-    required this.product,
-    required this.inCart,
-    this.hasAddons = false,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final active = inCart > 0;
-    return Material(
-      color: active ? AppColors.soft(AppColors.moduleKasir, 0.10) : AppColors.surface,
-      borderRadius: AppRadius.rLg,
-      child: InkWell(
-        borderRadius: AppRadius.rLg,
-        onTap: onTap,
-        splashColor: AppColors.soft(AppColors.moduleKasir, 0.10),
-        child: Container(
-          decoration: BoxDecoration(
-            borderRadius: AppRadius.rLg,
-            border: Border.all(
-              color: active
-                  ? AppColors.soft(AppColors.moduleKasir, 0.45)
-                  : AppColors.border,
-              width: active ? 1.5 : 1,
-            ),
-            boxShadow: active ? null : AppShadows.card,
-          ),
-          child: Padding(
-            padding: const EdgeInsets.all(AppSpacing.xs),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Expanded(
-                  child: ClipRRect(
-                    borderRadius: AppRadius.rMd,
-                    child: Stack(
-                      children: [
-                        Positioned.fill(
-                          child: MenuAvatar.fill(name: product.name),
-                        ),
-                        if (active)
-                          Positioned(
-                            top: 6,
-                            right: 6,
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(
-                                  horizontal: AppSpacing.xs, vertical: 3),
-                              decoration: BoxDecoration(
-                                color: AppColors.moduleKasir,
-                                borderRadius: AppRadius.rSm,
-                                boxShadow: AppShadows.glow(AppColors.moduleKasir),
-                              ),
-                              child: Text(
-                                '$inCart',
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w800,
-                                ),
-                              ),
-                            ),
-                          ),
-                        if (hasAddons)
-                          Positioned(
-                            top: 6,
-                            left: 6,
-                            child: Container(
-                              padding: const EdgeInsets.all(3),
-                              decoration: const BoxDecoration(
-                                color: AppColors.surface,
-                                borderRadius: AppRadius.rSm,
-                                boxShadow: AppShadows.card,
-                              ),
-                              child: const Icon(
-                                Icons.tune_rounded,
-                                size: 13,
-                                color: AppColors.moduleKasir,
-                              ),
-                            ),
-                          ),
-                      ],
-                    ),
-                  ),
-                ),
-                const SizedBox(height: AppSpacing.xs),
-                // Tinggi tetap 2 baris → nama panjang tampil penuh & area gambar
-                // tetap seragam di semua tile.
-                SizedBox(
-                  height: 34,
-                  child: Text(
-                    product.name,
-                    style: AppType.label
-                        .copyWith(color: AppColors.textPrimary, height: 1.2),
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  CurrencyHelper.format(product.price),
-                  style: AppType.body.copyWith(
-                    color: AppColors.moduleKasir,
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _CartItemTile extends StatelessWidget {
-  final String name;
-  final int qty;
-  final double price;
-  final String? status;
-  final String? notes;
-
-  /// Ringkasan add-on baris ini, mis. "Extra keju, Pedas". Kosong = tanpa
-  /// tambahan. Harganya sudah termasuk di [price].
-  final String addonLabel;
-  final VoidCallback? onAdd;
-  final VoidCallback? onRemove;
-  final VoidCallback? onEditNote;
-  final VoidCallback? onEditAddons; // null bila menu tak punya add-on
-  final VoidCallback? onDelete; // hapus/void item (butuh PIN manager/SVP)
-
-  const _CartItemTile({
-    required this.name,
-    required this.qty,
-    required this.price,
-    this.status,
-    this.notes,
-    this.addonLabel = '',
-    this.onAdd,
-    this.onRemove,
-    this.onEditNote,
-    this.onEditAddons,
-    this.onDelete,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-      child: Row(
-        children: [
-          // Tombol catatan diletakkan PALING DEPAN (sebelum item) agar terpisah
-          // jauh dari tombol +/− di kanan — mengurangi risiko salah ketuk.
-          if (onEditNote != null)
-            Padding(
-              padding: const EdgeInsets.only(right: 8),
-              child: GestureDetector(
-                onTap: onEditNote,
-                child: Container(
-                  width: 44,
-                  height: 44,
-                  decoration: BoxDecoration(
-                    color: (notes != null && notes!.isNotEmpty)
-                        ? AppColors.soft(AppColors.moduleKasir, 0.12)
-                        : AppColors.surfaceMuted,
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Icon(
-                    (notes != null && notes!.isNotEmpty)
-                        ? Icons.edit_note_rounded
-                        : Icons.note_add_outlined,
-                    size: 20,
-                    color: (notes != null && notes!.isNotEmpty)
-                        ? AppColors.moduleKasir
-                        : AppColors.textTertiary,
-                  ),
-                ),
-              ),
-            ),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text('$qty×  $name',
-                    style: const TextStyle(
-                        fontWeight: FontWeight.w500, fontSize: 13)),
-                Text(
-                  '@ ${CurrencyHelper.format(price)}  •  '
-                  '${CurrencyHelper.format(price * qty)}',
-                  style: const TextStyle(
-                      color: AppColors.moduleKasir,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w600),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                if (addonLabel.isNotEmpty)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 2),
-                    child: GestureDetector(
-                      onTap: onEditAddons,
-                      child: Text(
-                        '+ $addonLabel',
-                        style: const TextStyle(
-                          fontSize: 11,
-                          color: AppColors.textSecondary,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ),
-                  ),
-                if (notes != null && notes!.isNotEmpty)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 2),
-                    child: Text(
-                      '📝 $notes',
-                      style: const TextStyle(
-                        fontSize: 11,
-                        color: AppColors.textSecondary,
-                        fontStyle: FontStyle.italic,
-                      ),
-                    ),
-                  ),
-                // Baris tanpa add-on terpilih tetap bisa diracik lewat pintasan
-                // ini — tanpa perlu menghapus lalu menambah ulang itemnya.
-                if (addonLabel.isEmpty && onEditAddons != null)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 2),
-                    child: GestureDetector(
-                      onTap: onEditAddons,
-                      child: const Text(
-                        '+ Tambahan',
-                        style: TextStyle(
-                          fontSize: 11,
-                          color: AppColors.moduleKasir,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-          ),
-          if (status != null)
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-              decoration: BoxDecoration(
-                color: _statusColor(status!).withValues(alpha: 0.1),
-                borderRadius: BorderRadius.circular(6),
-              ),
-              child: Text(
-                status!.toUpperCase(),
-                style: TextStyle(
-                    fontSize: 9,
-                    color: _statusColor(status!),
-                    fontWeight: FontWeight.w600),
-              ),
-            ),
-          if (status != null && onDelete != null)
-            GestureDetector(
-              onTap: onDelete,
-              child: Container(
-                width: 44,
-                height: 44,
-                margin: const EdgeInsets.only(left: 8),
-                decoration: BoxDecoration(
-                  color: AppColors.soft(AppColors.danger, 0.12),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: const Icon(Icons.delete_outline,
-                    size: 16, color: AppColors.danger),
-              ),
-            ),
-          if (status == null) ...[
-            if (onRemove != null)
-              GestureDetector(
-                onTap: onRemove,
-                child: Container(
-                  width: 44,
-                  height: 44,
-                  decoration: BoxDecoration(
-                    color: AppColors.surfaceMuted,
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: const Icon(Icons.remove, size: 16),
-                ),
-              ),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-              child: Text('$qty',
-                  style: const TextStyle(
-                      fontWeight: FontWeight.bold, fontSize: 14)),
-            ),
-            if (onAdd != null)
-              GestureDetector(
-                onTap: onAdd,
-                child: Container(
-                  width: 44,
-                  height: 44,
-                  decoration: BoxDecoration(
-                    color: AppColors.moduleKasir,
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: const Icon(Icons.add, size: 16, color: Colors.white),
-                ),
-              ),
-          ],
-        ],
-      ),
-    );
-  }
-
-  Color _statusColor(String status) {
-    switch (status) {
-      case 'pending':
-        return AppColors.warning;
-      case 'cooking':
-        return AppColors.moduleProduk;
-      case 'ready':
-        return AppColors.success;
-      case 'served':
-        return AppColors.textTertiary;
-      default:
-        return AppColors.textTertiary;
-    }
-  }
-}
-
-// ── Movements History Dialog ──────────────────────────────────────────────────
 
 class _VoidTransactionPicker extends StatefulWidget {
   final Future<List<Order>> Function() getPaidOrders;
@@ -5722,954 +4091,5 @@ class _SwapShiftDialogState extends State<_SwapShiftDialog> {
 
 // ── Payment Sheet ─────────────────────────────────────────────────────────────
 
-class _PaymentSheet extends StatefulWidget {
-  final double total;
-  final TextEditingController controller;
-  final void Function(String method, double amount) onPay;
-
-  const _PaymentSheet({
-    required this.total,
-    required this.controller,
-    required this.onPay,
-  });
-
-  @override
-  State<_PaymentSheet> createState() => _PaymentSheetState();
-}
-
-class _PaymentSheetState extends State<_PaymentSheet> {
-  String _method = 'cash';
-
-  double get _parsedAmount {
-    final raw = widget.controller.text.replaceAll('.', '');
-    return double.tryParse(raw) ?? 0;
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final change = _parsedAmount - widget.total;
-
-    return Padding(
-      padding: const EdgeInsets.all(28),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('Pembayaran', style: AppType.h2),
-                    const SizedBox(height: 2),
-                    Text(
-                      'Total: ${CurrencyHelper.format(widget.total)}',
-                      style: AppType.title.copyWith(color: AppColors.moduleKasir),
-                    ),
-                  ],
-                ),
-              ),
-              IconButton(
-                onPressed: () => Navigator.pop(context),
-                icon: const Icon(Icons.close, color: AppColors.textTertiary),
-                padding: EdgeInsets.zero,
-              ),
-            ],
-          ),
-          const SizedBox(height: 20),
-
-          // Payment method
-          Text('Metode Pembayaran', style: AppType.label),
-          const SizedBox(height: 10),
-          Wrap(
-            spacing: 8,
-            children: [
-              _methodChip('cash', 'Tunai', Icons.money),
-              _methodChip('card', 'Kartu', Icons.credit_card),
-              _methodChip('qris', 'QRIS', Icons.qr_code),
-              _methodChip('transfer', 'Transfer', Icons.account_balance),
-            ],
-          ),
-          const SizedBox(height: 20),
-
-          // Amount input (only cash)
-          if (_method == 'cash') ...[
-            Text('Jumlah Bayar', style: AppType.label),
-            const SizedBox(height: 8),
-            TextField(
-              controller: widget.controller,
-              keyboardType: TextInputType.number,
-              inputFormatters: [RupiahInputFormatter()],
-              decoration: InputDecoration(
-                prefixText: 'Rp ',
-                border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(12)),
-                focusedBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide:
-                      const BorderSide(color: AppColors.moduleKasir, width: 2),
-                ),
-                contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 16, vertical: 14),
-              ),
-              onChanged: (_) => setState(() {}),
-            ),
-            const SizedBox(height: 10),
-            Text(
-              change >= 0
-                  ? 'Kembalian: ${CurrencyHelper.format(change)}'
-                  : 'Kurang: ${CurrencyHelper.format(-change)}',
-              style: TextStyle(
-                fontWeight: FontWeight.bold,
-                fontSize: 14,
-                color: change >= 0
-                    ? AppColors.moduleKasir
-                    : AppColors.danger,
-              ),
-            ),
-            const SizedBox(height: 16),
-          ],
-
-          const SizedBox(height: 4),
-          AppButton(
-            label: 'PROSES PEMBAYARAN',
-            icon: Icons.check_circle_outline_rounded,
-            accent: AppColors.moduleKasir,
-            onPressed: () {
-              if (_method == 'cash') {
-                if (_parsedAmount < widget.total) return;
-                widget.onPay(_method, _parsedAmount);
-              } else {
-                widget.onPay(_method, widget.total);
-              }
-            },
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _methodChip(String value, String label, IconData icon) {
-    final selected = _method == value;
-    return ChoiceChip(
-      label: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon,
-              size: 16,
-              color: selected ? Colors.white : AppColors.textSecondary),
-          const SizedBox(width: 4),
-          Text(label),
-        ],
-      ),
-      selected: selected,
-      onSelected: (_) => setState(() => _method = value),
-      selectedColor: AppColors.moduleKasir,
-      labelStyle: TextStyle(
-          color: selected ? Colors.white : AppColors.textSecondary,
-          fontWeight: FontWeight.w600),
-    );
-  }
-}
 
 // ── Split Bill (pilih item per orang) ─────────────────────────────────────────
-class _SplitBillDialog extends StatefulWidget {
-  final CashierController controller;
-  const _SplitBillDialog({required this.controller});
-
-  @override
-  State<_SplitBillDialog> createState() => _SplitBillDialogState();
-}
-
-class _SplitBillDialogState extends State<_SplitBillDialog> {
-  final _paidQty = <String, int>{}; // unit sudah dibayar per item (sesi ini)
-  final _selQty = <String, int>{}; // unit dipilih untuk bagian saat ini
-  String _method = 'cash';
-  int _payer = 1;
-
-  CashierController get _c => widget.controller;
-
-  List<OrderItem> get _items => _c.state.orderItems;
-
-  int _paidOf(String id) => _paidQty[id] ?? 0;
-  int _selOf(String id) => _selQty[id] ?? 0;
-  int _availOf(OrderItem i) => i.qty - _paidOf(i.id);
-
-  bool get _hasSelection => _selQty.values.any((q) => q > 0);
-
-  /// Semua sisa unit (dari item yang belum lunas) tercentang → bagian terakhir
-  /// (bayar sisa persis, hindari selisih pembulatan).
-  bool get _isFinalSelection {
-    var anyAvail = false;
-    for (final i in _items) {
-      final avail = _availOf(i);
-      if (avail <= 0) continue;
-      anyAvail = true;
-      if (_selOf(i.id) != avail) return false;
-    }
-    return anyAvail;
-  }
-
-  void _setQty(String id, int q, int max) {
-    final v = q.clamp(0, max);
-    setState(() {
-      if (v == 0) {
-        _selQty.remove(id);
-      } else {
-        _selQty[id] = v;
-      }
-    });
-  }
-
-  Future<void> _payPart() async {
-    if (!_hasSelection) return;
-    final res = await _c.paySplitByQty(
-      qtyByItem: Map<String, int>.from(_selQty),
-      method: _method,
-      isFinal: _isFinalSelection,
-    );
-    if (res == null) {
-      if (mounted && _c.state.errorMessage != null) {
-        showAppSnack(context, _c.state.errorMessage!, isError: true);
-      }
-      return;
-    }
-    if (!mounted) return;
-    if (res['payment_status'] == 'paid') {
-      Navigator.pop(context);
-      showAppSnack(context, 'Split bill selesai — semua bagian lunas');
-      return;
-    }
-    setState(() {
-      _selQty.forEach((id, q) => _paidQty[id] = _paidOf(id) + q);
-      _selQty.clear();
-      _payer++;
-    });
-  }
-
-  /// Baris item dengan stepper jumlah unit (0..sisa). Item lunas dikunci.
-  Widget _splitItemRow(OrderItem it) {
-    final total = it.qty;
-    final paid = _paidOf(it.id);
-    final avail = total - paid;
-    final sel = _selOf(it.id);
-    final done = avail <= 0;
-    return Opacity(
-      opacity: done ? 0.5 : 1,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-        child: Row(
-          children: [
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(it.productName,
-                      style: TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w600,
-                        decoration: done ? TextDecoration.lineThrough : null,
-                      )),
-                  Text(
-                    done
-                        ? 'LUNAS · ${total}x'
-                        : '${CurrencyHelper.format(it.price)} / unit · sisa $avail dari ${total}x',
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: done
-                          ? AppColors.moduleKasir
-                          : AppColors.textSecondary,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            if (!done)
-              Row(
-                children: [
-                  _qtyBtn(Icons.remove, sel > 0,
-                      () => _setQty(it.id, sel - 1, avail)),
-                  Container(
-                    width: 34,
-                    alignment: Alignment.center,
-                    child: Text('$sel',
-                        style: const TextStyle(
-                            fontSize: 16, fontWeight: FontWeight.w700)),
-                  ),
-                  _qtyBtn(Icons.add, sel < avail,
-                      () => _setQty(it.id, sel + 1, avail)),
-                ],
-              ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _qtyBtn(IconData icon, bool enabled, VoidCallback onTap) {
-    return InkWell(
-      onTap: enabled ? onTap : null,
-      borderRadius: BorderRadius.circular(8),
-      child: Container(
-        width: 44,
-        height: 44,
-        decoration: BoxDecoration(
-          color: enabled ? AppColors.soft(AppColors.moduleProduk, 0.10) : AppColors.surfaceMuted,
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: Icon(icon,
-            size: 18,
-            color: enabled ? AppColors.moduleProduk : AppColors.textTertiary),
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final share = _c.splitShareForQty(_selQty);
-    final order = _c.state.currentOrder;
-    final remaining = order?.remaining ?? 0;
-    final allSelected = _isFinalSelection;
-
-    return Dialog(
-      insetPadding: const EdgeInsets.symmetric(horizontal: 28, vertical: 36),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-      child: ConstrainedBox(
-        constraints: BoxConstraints(
-          maxWidth: 520,
-          maxHeight: MediaQuery.of(context).size.height * 0.85,
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            // Header
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.fromLTRB(20, 16, 12, 16),
-              decoration: BoxDecoration(
-                color: AppColors.soft(AppColors.moduleProduk, 0.10),
-                borderRadius: const BorderRadius.vertical(top: Radius.circular(AppRadius.xl)),
-              ),
-              child: Row(
-                children: [
-                  const Icon(Icons.call_split, color: AppColors.moduleProduk),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text('Split Bill',
-                            style: TextStyle(
-                                fontSize: 18,
-                                fontWeight: FontWeight.bold,
-                                color: AppColors.moduleProduk)),
-                        Text('Bagian ke-$_payer • sisa tagihan ${CurrencyHelper.format(remaining)}',
-                            style: const TextStyle(
-                                fontSize: 12, color: AppColors.moduleProduk)),
-                      ],
-                    ),
-                  ),
-                  IconButton(
-                    onPressed: () => Navigator.pop(context),
-                    icon: const Icon(Icons.close, color: AppColors.moduleProduk),
-                  ),
-                ],
-              ),
-            ),
-            // Items
-            Flexible(
-              child: ListView(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                children: [
-                  const Padding(
-                    padding: EdgeInsets.fromLTRB(8, 4, 8, 8),
-                    child: Text(
-                        'Pilih jumlah unit untuk pembayar bagian ini:',
-                        style: TextStyle(fontSize: 12, color: AppColors.textSecondary)),
-                  ),
-                  ..._items.map(_splitItemRow),
-                ],
-              ),
-            ),
-            const Divider(height: 1),
-            // Method + amount + pay
-            Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Wrap(
-                    spacing: 8,
-                    children: [
-                      _mChip('cash', 'Tunai', Icons.money),
-                      _mChip('card', 'Kartu', Icons.credit_card),
-                      _mChip('qris', 'QRIS', Icons.qr_code),
-                      _mChip('transfer', 'Transfer', Icons.account_balance),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Text(allSelected ? 'Bayar sisa (bagian akhir)' : 'Bagian ini',
-                          style: const TextStyle(
-                              fontSize: 14, color: AppColors.textSecondary)),
-                      Text(
-                        CurrencyHelper.format(allSelected ? remaining : share),
-                        style: const TextStyle(
-                            fontSize: 18,
-                            fontWeight: FontWeight.bold,
-                            color: AppColors.moduleProduk),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  AppButton(
-                    label: 'Bayar Bagian Ini',
-                    icon: Icons.payments_outlined,
-                    accent: AppColors.moduleProduk,
-                    loading: _c.state.isProcessing,
-                    size: AppButtonSize.medium,
-                    onPressed: (!_hasSelection || _c.state.isProcessing)
-                        ? null
-                        : _payPart,
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _mChip(String value, String label, IconData icon) {
-    final selected = _method == value;
-    return GestureDetector(
-      onTap: () => setState(() => _method = value),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        constraints: const BoxConstraints(minHeight: 44),
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: selected ? AppColors.moduleProduk : AppColors.surfaceMuted,
-          borderRadius: BorderRadius.circular(10),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon,
-                size: 16,
-                color: selected ? Colors.white : AppColors.textSecondary),
-            const SizedBox(width: 6),
-            Text(label,
-                style: TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w600,
-                  color: selected ? Colors.white : AppColors.textSecondary,
-                )),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// ── Pilih Meja: dialog tengah, besar, scroll, dengan pencarian ────────────────
-class _TablePickerDialog extends StatefulWidget {
-  final List<RestaurantTable> tables;
-  final String? selectedNumber;
-  const _TablePickerDialog({required this.tables, this.selectedNumber});
-
-  @override
-  State<_TablePickerDialog> createState() => _TablePickerDialogState();
-}
-
-class _TablePickerDialogState extends State<_TablePickerDialog> {
-  String _q = '';
-
-  @override
-  Widget build(BuildContext context) {
-    final size = MediaQuery.of(context).size;
-    final q = _q.trim().toLowerCase();
-    final filtered = q.isEmpty
-        ? widget.tables
-        : widget.tables
-            .where((t) => t.tableNumber.toLowerCase().contains(q))
-            .toList();
-
-    return Dialog(
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-      insetPadding: const EdgeInsets.symmetric(horizontal: 40, vertical: 40),
-      child: SizedBox(
-        // Selalu tampil BESAR; bila meja banyak → area daftar yang scroll.
-        width: size.width > 820 ? 760 : size.width * 0.9,
-        height: size.height * 0.82,
-        child: Padding(
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            mainAxisSize: MainAxisSize.max,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  const Icon(Icons.table_restaurant_outlined,
-                      color: AppColors.moduleKasir, size: 26),
-                  const SizedBox(width: 10),
-                  const Text('Pilih Meja',
-                      style: TextStyle(
-                          fontSize: 22, fontWeight: FontWeight.w800)),
-                  const Spacer(),
-                  IconButton(
-                    onPressed: () => Navigator.pop(context),
-                    icon: const Icon(Icons.close),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                autofocus: true,
-                onChanged: (v) => setState(() => _q = v),
-                decoration: InputDecoration(
-                  hintText: 'Cari meja... (mis. A5, 12)',
-                  prefixIcon: const Icon(Icons.search),
-                  border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12)),
-                  contentPadding:
-                      const EdgeInsets.symmetric(horizontal: 14, vertical: 0),
-                ),
-              ),
-              const SizedBox(height: 16),
-              Flexible(
-                child: filtered.isEmpty
-                    ? const Center(
-                        child: Text('Meja tidak ditemukan',
-                            style: TextStyle(color: AppColors.textTertiary)))
-                    : GridView.builder(
-                        padding: EdgeInsets.zero,
-                        // Kolom mengisi lebar; di HP lebih sedikit agar tak
-                        // sempit, sisanya scroll ke bawah.
-                        gridDelegate:
-                            SliverGridDelegateWithFixedCrossAxisCount(
-                          crossAxisCount: context.isPhone ? 3 : 5,
-                          mainAxisSpacing: 12,
-                          crossAxisSpacing: 12,
-                          childAspectRatio: 1.25,
-                        ),
-                        itemCount: filtered.length,
-                        itemBuilder: (_, i) => _tile(filtered[i]),
-                      ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _tile(RestaurantTable table) {
-    final isAvailable = table.status == 'available';
-    final isSelected = widget.selectedNumber == table.tableNumber;
-    return Material(
-      color: isSelected
-          ? AppColors.moduleKasir
-          : isAvailable
-              ? AppColors.surfaceMuted
-              : AppColors.warningSoft,
-      borderRadius: BorderRadius.circular(14),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(14),
-        onTap: () => Navigator.pop(context, table),
-        child: Center(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Text(
-                table.tableNumber,
-                style: TextStyle(
-                  fontSize: 22,
-                  fontWeight: FontWeight.bold,
-                  color: isSelected
-                      ? Colors.white
-                      : !isAvailable
-                          ? AppColors.warning
-                          : AppColors.textPrimary,
-                ),
-              ),
-              const SizedBox(height: 3),
-              Text(
-                isAvailable ? 'Tersedia' : 'Terisi',
-                style: TextStyle(
-                  fontSize: 12,
-                  color: isSelected ? Colors.white70 : AppColors.textSecondary,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-// ── Gabung Meja: pilih order meja lain ────────────────────────────────────────
-class _MergePicker extends StatefulWidget {
-  final Future<List<Order>> Function() getOrders;
-  final String targetTable;
-  final void Function(Order) onPick;
-  final String? title; // null → judul default "Gabung ke Meja X"
-  final IconData headerIcon;
-  const _MergePicker(
-      {required this.getOrders,
-      required this.targetTable,
-      required this.onPick,
-      this.title,
-      this.headerIcon = Icons.merge_type});
-
-  @override
-  State<_MergePicker> createState() => _MergePickerState();
-}
-
-class _MergePickerState extends State<_MergePicker> {
-  List<Order>? _orders;
-
-  @override
-  void initState() {
-    super.initState();
-    widget.getOrders().then((o) {
-      if (mounted) setState(() => _orders = o);
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final orders = _orders;
-    return Dialog(
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-      child: ConstrainedBox(
-        constraints: BoxConstraints(
-            maxWidth: 480, maxHeight: MediaQuery.of(context).size.height * 0.7),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 18, 12, 8),
-              child: Row(
-                children: [
-                  Icon(widget.headerIcon, color: AppColors.info),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Text(
-                        widget.title ?? 'Gabung ke Meja ${widget.targetTable}',
-                        style: const TextStyle(
-                            fontSize: 16, fontWeight: FontWeight.bold)),
-                  ),
-                  IconButton(
-                    onPressed: () => Navigator.pop(context),
-                    icon: const Icon(Icons.close, color: AppColors.textTertiary),
-                  ),
-                ],
-              ),
-            ),
-            const Divider(height: 1),
-            if (orders == null)
-              const Padding(
-                padding: EdgeInsets.all(40),
-                child: CircularProgressIndicator(color: AppColors.info),
-              )
-            else if (orders.isEmpty)
-              const Padding(
-                padding: EdgeInsets.all(40),
-                child: Text('Tidak ada meja lain dengan pesanan aktif',
-                    style: TextStyle(color: AppColors.textTertiary)),
-              )
-            else
-              Flexible(
-                child: ListView.separated(
-                  padding: const EdgeInsets.all(12),
-                  itemCount: orders.length,
-                  separatorBuilder: (_, __) => const SizedBox(height: 8),
-                  itemBuilder: (_, i) {
-                    final o = orders[i];
-                    return Material(
-                      color: AppColors.surface,
-                      borderRadius: BorderRadius.circular(12),
-                      child: InkWell(
-                        borderRadius: BorderRadius.circular(12),
-                        onTap: () => widget.onPick(o),
-                        child: Container(
-                          padding: const EdgeInsets.all(12),
-                          decoration: BoxDecoration(
-                            borderRadius: BorderRadius.circular(12),
-                            border:
-                                Border.all(color: AppColors.border),
-                          ),
-                          child: Row(
-                            children: [
-                              Container(
-                                width: 46,
-                                height: 46,
-                                decoration: BoxDecoration(
-                                  color: AppColors.soft(AppColors.info, 0.14),
-                                  borderRadius: BorderRadius.circular(12),
-                                ),
-                                alignment: Alignment.center,
-                                child: Text(o.tableNumber,
-                                    style: const TextStyle(
-                                        fontWeight: FontWeight.w800,
-                                        fontSize: 15,
-                                        color: AppColors.info)),
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text('Meja ${o.tableNumber}',
-                                        style: const TextStyle(
-                                            fontWeight: FontWeight.w700,
-                                            fontSize: 14)),
-                                    Text('${o.basketSize} item',
-                                        style: const TextStyle(
-                                            fontSize: 12,
-                                            color: AppColors.textTertiary)),
-                                  ],
-                                ),
-                              ),
-                              Text(CurrencyHelper.format(o.totalAmount),
-                                  style: const TextStyle(
-                                      fontWeight: FontWeight.w800,
-                                      fontSize: 14)),
-                            ],
-                          ),
-                        ),
-                      ),
-                    );
-                  },
-                ),
-              ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// ── Gabung Pembayaran: bayar campur metode (cash + qris dll) ──────────────────
-class _MixedPaymentDialog extends StatefulWidget {
-  final CashierController controller;
-  const _MixedPaymentDialog({required this.controller});
-
-  @override
-  State<_MixedPaymentDialog> createState() => _MixedPaymentDialogState();
-}
-
-class _MixedPaymentDialogState extends State<_MixedPaymentDialog> {
-  final _amountCtrl = TextEditingController();
-  String _method = 'cash';
-  final _lines = <({String method, double amount})>[];
-
-  CashierController get _c => widget.controller;
-  double get _remaining => _c.state.currentOrder?.remaining ?? 0;
-
-  @override
-  void initState() {
-    super.initState();
-    _amountCtrl.text = _remaining.toStringAsFixed(0);
-  }
-
-  @override
-  void dispose() {
-    _amountCtrl.dispose();
-    super.dispose();
-  }
-
-  Future<void> _addPayment() async {
-    final raw = _amountCtrl.text.replaceAll(RegExp(r'[^\d]'), '');
-    var amount = double.tryParse(raw) ?? 0;
-    if (amount <= 0) return;
-    if (amount > _remaining) amount = _remaining;
-    final method = _method;
-    final res = await _c.payPartial(amount: amount, method: method);
-    if (res == null) {
-      if (mounted && _c.state.errorMessage != null) {
-        showAppSnack(context, _c.state.errorMessage!, isError: true);
-      }
-      return;
-    }
-    if (!mounted) return;
-    if (res['payment_status'] == 'paid') {
-      Navigator.pop(context);
-      showAppSnack(context, 'Pembayaran gabungan selesai — lunas');
-      return;
-    }
-    setState(() {
-      _lines.add((method: method, amount: amount));
-      _amountCtrl.text = _remaining.toStringAsFixed(0);
-    });
-  }
-
-  String _methodLabel(String m) => const {
-        'cash': 'Tunai',
-        'card': 'Kartu',
-        'qris': 'QRIS',
-        'transfer': 'Transfer',
-      }[m] ?? m;
-
-  @override
-  Widget build(BuildContext context) {
-    final order = _c.state.currentOrder;
-    final total = order?.totalAmount ?? 0;
-    final paid = total - _remaining;
-
-    return Dialog(
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 460),
-        child: Padding(
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Row(
-                children: [
-                  const Icon(Icons.payments_outlined, color: AppColors.moduleMeja),
-                  const SizedBox(width: 10),
-                  const Expanded(
-                    child: Text('Gabung Pembayaran',
-                        style: TextStyle(
-                            fontSize: 18, fontWeight: FontWeight.bold)),
-                  ),
-                  IconButton(
-                    onPressed: () => Navigator.pop(context),
-                    icon: const Icon(Icons.close, color: AppColors.textTertiary),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 8),
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: AppColors.surfaceAlt,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Column(
-                  children: [
-                    _row('Total', total, bold: true),
-                    const SizedBox(height: 4),
-                    _row('Terbayar', paid, color: AppColors.moduleKasir),
-                    const Divider(height: 16),
-                    _row('Sisa', _remaining,
-                        bold: true, color: AppColors.danger),
-                  ],
-                ),
-              ),
-              if (_lines.isNotEmpty) ...[
-                const SizedBox(height: 10),
-                ..._lines.map((l) => Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 2),
-                      child: Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          Text('• ${_methodLabel(l.method)}',
-                              style: const TextStyle(fontSize: 13)),
-                          Text(CurrencyHelper.format(l.amount),
-                              style: const TextStyle(
-                                  fontSize: 13, fontWeight: FontWeight.w600)),
-                        ],
-                      ),
-                    )),
-              ],
-              const SizedBox(height: 14),
-              const Text('Metode',
-                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
-              const SizedBox(height: 8),
-              Wrap(
-                spacing: 8,
-                children: [
-                  _mChip('cash', 'Tunai', Icons.money),
-                  _mChip('card', 'Kartu', Icons.credit_card),
-                  _mChip('qris', 'QRIS', Icons.qr_code),
-                  _mChip('transfer', 'Transfer', Icons.account_balance),
-                ],
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: _amountCtrl,
-                keyboardType: TextInputType.number,
-                inputFormatters: [RupiahInputFormatter()],
-                style:
-                    const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                decoration: const InputDecoration(
-                  labelText: 'Jumlah bayar (metode ini)',
-                  prefixText: 'Rp ',
-                  border: OutlineInputBorder(),
-                ),
-              ),
-              const SizedBox(height: 14),
-              AppButton(
-                label: _remaining > 0 ? 'Tambah Pembayaran' : 'Lunas',
-                icon: Icons.add_rounded,
-                accent: AppColors.moduleMeja,
-                loading: _c.state.isProcessing,
-                onPressed: _c.state.isProcessing ? null : _addPayment,
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _row(String label, double v, {bool bold = false, Color? color}) {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-      children: [
-        Text(label,
-            style: TextStyle(
-                fontSize: 13,
-                color: AppColors.textSecondary,
-                fontWeight: bold ? FontWeight.bold : FontWeight.normal)),
-        Text(CurrencyHelper.format(v),
-            style: TextStyle(
-                fontSize: bold ? 16 : 13,
-                fontWeight: bold ? FontWeight.bold : FontWeight.w500,
-                color: color ?? AppColors.textPrimary)),
-      ],
-    );
-  }
-
-  Widget _mChip(String value, String label, IconData icon) {
-    final selected = _method == value;
-    return GestureDetector(
-      onTap: () => setState(() => _method = value),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        constraints: const BoxConstraints(minHeight: 44),
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: selected ? AppColors.moduleMeja : AppColors.surfaceMuted,
-          borderRadius: BorderRadius.circular(10),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon,
-                size: 16,
-                color: selected ? Colors.white : AppColors.textSecondary),
-            const SizedBox(width: 6),
-            Text(label,
-                style: TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w600,
-                  color: selected ? Colors.white : AppColors.textSecondary,
-                )),
-          ],
-        ),
-      ),
-    );
-  }
-}

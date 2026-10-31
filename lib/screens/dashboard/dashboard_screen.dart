@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../app.dart';
 import '../../controllers/dashboard_controller.dart';
 import '../../models/models.dart';
+import '../../services/app_events.dart';
 import '../../theme/theme.dart';
 import '../../utils/currency.dart';
 import '../../widgets/ui/ui.dart';
@@ -40,7 +41,8 @@ class DashboardScreen extends ConsumerStatefulWidget {
   ConsumerState<DashboardScreen> createState() => _DashboardScreenState();
 }
 
-class _DashboardScreenState extends ConsumerState<DashboardScreen> {
+class _DashboardScreenState extends ConsumerState<DashboardScreen>
+    with AppEventsRefresh<DashboardScreen> {
   late final DashboardController _controller;
 
   static const _roleMenuAccess = <String, Set<String>>{
@@ -122,7 +124,13 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
     _controller = DashboardController();
     _controller.addListener(_onStateChanged);
     _controller.initialize();
+    // Ringkasan (order aktif / meja terisi / omzet) ikut berubah saat station
+    // atau layar lain membuat & membayar order.
+    listenDataChanges();
   }
+
+  @override
+  void onDataChanged() => _controller.refresh();
 
   @override
   void deactivate() {
@@ -132,6 +140,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
 
   @override
   void dispose() {
+    cancelDataChanges();
     _controller.dispose();
     super.dispose();
   }
@@ -194,8 +203,15 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
 
     final allowed =
         _allMenuItems.where((m) => allowedMenus.contains(m.key)).toList();
-    final primaries = allowed.where((m) => m.isPrimary).toList();
-    final secondaries = allowed.where((m) => !m.isPrimary).toList();
+    var primaries = allowed.where((m) => m.isPrimary).toList();
+    var secondaries = allowed.where((m) => !m.isPrimary).toList();
+    // Role tanpa item "primary" bawaan (mis. dapur/bar cuma punya akses Dapur,
+    // yang ditandai sekunder utk admin) — promosikan akses mereka jadi kartu
+    // utama, jika tidak dashboard terasa kosong (1 kartu kecil di halaman luas).
+    if (primaries.isEmpty && secondaries.isNotEmpty) {
+      primaries = secondaries;
+      secondaries = const [];
+    }
 
     if (context.isPhone) {
       return _buildPhone(user, role, primaries, secondaries, dashState, isAdmin);
@@ -242,7 +258,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                         child: Padding(
                           padding: EdgeInsets.fromLTRB(
                               context.pagePadX, AppSpacing.lg, context.pagePadX, 0),
-                          child: _StatsRow(state: dashState),
+                          child: _StatsOverview(state: dashState),
                         ),
                       ),
                     SliverPadding(
@@ -290,7 +306,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> {
                 padding: EdgeInsets.all(context.pagePadX),
                 children: [
                   if (isAdmin) ...[
-                    _StatsGrid(state: dashState),
+                    _StatsOverview(state: dashState),
                     const SizedBox(height: AppSpacing.lg),
                   ],
                   _MenuBody(
@@ -835,128 +851,239 @@ class _SidebarItemState extends State<_SidebarItem> {
   }
 }
 
-// ── Stats Row (tablet) ────────────────────────────────────────────────────────
+// ── Stats Overview (hero revenue + compact cards) ──────────────────────────────
+//
+// Revenue jadi hero card (paling penting → paling menonjol), status shift
+// ditempel sebagai badge di hero agar tak perlu kartu terpisah. Dua kartu
+// ringkas di bawahnya memberi konteks operasional sekilas; kartu meja punya
+// mini progress-bar agar tingkat keterisian langsung terbaca tanpa berhitung.
 
-class _StatsRow extends StatelessWidget {
+class _StatsOverview extends StatelessWidget {
   final DashboardState state;
-  const _StatsRow({required this.state});
+  const _StatsOverview({required this.state});
 
   @override
   Widget build(BuildContext context) {
     if (state.isLoading) {
-      return const SizedBox(height: 76, child: AppLoader());
+      return const SizedBox(height: 148, child: AppLoader());
     }
-    final cards = _statCards(state, compact: false);
-    return Row(
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        for (int i = 0; i < cards.length; i++) ...[
-          if (i > 0) const SizedBox(width: AppSpacing.sm),
-          Expanded(child: cards[i]),
-        ],
+        _RevenueHeroCard(state: state),
+        const SizedBox(height: AppSpacing.sm),
+        IntrinsicHeight(
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Expanded(
+                child: _CompactStatCard(
+                  label: 'Order Aktif',
+                  value: '${state.totalActiveOrders}',
+                  icon: Icons.receipt_long_rounded,
+                  color: AppColors.accent, // SECONDARY gold
+                ),
+              ),
+              const SizedBox(width: AppSpacing.sm),
+              Expanded(child: _OccupancyStatCard(state: state)),
+            ],
+          ),
+        ),
       ],
     );
   }
 }
 
-// ── Stats Grid (phone) ────────────────────────────────────────────────────────
-
-class _StatsGrid extends StatelessWidget {
+class _RevenueHeroCard extends StatelessWidget {
   final DashboardState state;
-  const _StatsGrid({required this.state});
+  const _RevenueHeroCard({required this.state});
 
   @override
   Widget build(BuildContext context) {
-    if (state.isLoading) {
-      return const SizedBox(height: 60, child: AppLoader());
-    }
-    // 2 kolom di HP; aspect lebih tinggi (2.4) memberi ruang vertikal agar
-    // kartu tak overflow di portrait sempit (~360px).
-    return GridView.count(
-      shrinkWrap: true,
-      physics: const NeverScrollableScrollPhysics(),
-      crossAxisCount: context.gridColumns(minTileWidth: 150).clamp(1, 2),
-      mainAxisSpacing: AppSpacing.xs,
-      crossAxisSpacing: AppSpacing.xs,
-      childAspectRatio: 2.4,
-      children: _statCards(state, compact: true),
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(AppSpacing.lg),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          colors: AppColors.brandGradient,
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        borderRadius: AppRadius.rLg,
+        boxShadow: AppShadows.glow(AppColors.brand, strength: 0.24),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.trending_up_rounded,
+                        size: 15, color: AppColors.soft(Colors.white, 0.85)),
+                    const SizedBox(width: 4),
+                    Text(
+                      'REVENUE HARI INI',
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: 1.0,
+                        color: AppColors.soft(Colors.white, 0.85),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  CurrencyHelper.format(state.todayRevenue),
+                  style: AppType.amountLg.copyWith(color: Colors.white),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: AppSpacing.sm),
+          _ShiftBadge(active: state.hasActiveShift),
+        ],
+      ),
     );
   }
 }
 
-List<Widget> _statCards(DashboardState state, {required bool compact}) => [
-      _StatCard(
-        label: compact ? 'Revenue' : 'Revenue Hari Ini',
-        value: CurrencyHelper.format(state.todayRevenue),
-        icon: Icons.trending_up_rounded,
-        color: AppColors.success,
-        compact: compact,
-      ),
-      _StatCard(
-        label: 'Order Aktif',
-        value: '${state.totalActiveOrders}',
-        icon: Icons.receipt_long_rounded,
-        color: AppColors.accent, // SECONDARY gold
-        compact: compact,
-      ),
-      _StatCard(
-        label: 'Meja Terisi',
-        value: '${state.occupiedTables}/${state.totalTables}',
-        icon: Icons.table_restaurant_rounded,
-        color: AppColors.brand,
-        compact: compact,
-      ),
-      _StatCard(
-        label: compact ? 'Shift' : 'Status Shift',
-        value: state.hasActiveShift ? 'Aktif' : 'Tidak Ada',
-        icon: Icons.schedule_rounded,
-        color: state.hasActiveShift ? AppColors.brand : AppColors.textTertiary,
-        compact: compact,
-      ),
-    ];
+class _ShiftBadge extends StatelessWidget {
+  final bool active;
+  const _ShiftBadge({required this.active});
 
-// ── Stat Card ─────────────────────────────────────────────────────────────────
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: AppSpacing.xs),
+      decoration: BoxDecoration(
+        color: AppColors.soft(Colors.white, 0.16),
+        borderRadius: AppRadius.rPill,
+        border: Border.all(color: AppColors.soft(Colors.white, 0.28)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 7,
+            height: 7,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: active ? AppColors.brandLight : AppColors.soft(Colors.white, 0.5),
+            ),
+          ),
+          const SizedBox(width: 6),
+          Text(
+            active ? 'Shift Aktif' : 'Shift Tutup',
+            style: const TextStyle(color: Colors.white, fontSize: 11.5, fontWeight: FontWeight.w700),
+          ),
+        ],
+      ),
+    );
+  }
+}
 
-class _StatCard extends StatelessWidget {
+class _CompactStatCard extends StatelessWidget {
   final String label;
   final String value;
   final IconData icon;
   final Color color;
-  final bool compact;
 
-  const _StatCard({
+  const _CompactStatCard({
     required this.label,
     required this.value,
     required this.icon,
     required this.color,
-    this.compact = false,
   });
 
   @override
   Widget build(BuildContext context) {
     return AppCard(
-      padding: EdgeInsets.all(compact ? AppSpacing.sm : AppSpacing.md),
+      padding: const EdgeInsets.all(AppSpacing.sm),
       child: Row(
         children: [
-          IconBadge(icon: icon, color: color, size: compact ? 34 : 46),
+          IconBadge(icon: icon, color: color, size: 38),
           const SizedBox(width: AppSpacing.sm),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisAlignment: MainAxisAlignment.center,
+              mainAxisSize: MainAxisSize.min,
               children: [
                 Text(
                   value,
-                  style: (compact ? AppType.title : AppType.amount).copyWith(color: color),
+                  style: AppType.title.copyWith(color: color),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
                 Text(
                   label,
-                  style: AppType.caption.copyWith(color: AppColors.textTertiary),
+                  style: AppType.caption,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
               ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _OccupancyStatCard extends StatelessWidget {
+  final DashboardState state;
+  const _OccupancyStatCard({required this.state});
+
+  @override
+  Widget build(BuildContext context) {
+    final ratio = state.totalTables > 0 ? state.occupiedTables / state.totalTables : 0.0;
+    final barColor = ratio >= 0.85
+        ? AppColors.danger
+        : ratio >= 0.5
+            ? AppColors.warning
+            : AppColors.brand;
+
+    return AppCard(
+      padding: const EdgeInsets.all(AppSpacing.sm),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              IconBadge(icon: Icons.table_restaurant_rounded, color: barColor, size: 38),
+              const SizedBox(width: AppSpacing.sm),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      '${state.occupiedTables}/${state.totalTables}',
+                      style: AppType.title.copyWith(color: barColor),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    Text('Meja Terisi', style: AppType.caption, maxLines: 1, overflow: TextOverflow.ellipsis),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: AppSpacing.xs),
+          ClipRRect(
+            borderRadius: AppRadius.rPill,
+            child: LinearProgressIndicator(
+              value: ratio.clamp(0.0, 1.0),
+              minHeight: 4,
+              backgroundColor: AppColors.soft(barColor, 0.14),
+              valueColor: AlwaysStoppedAnimation(barColor),
             ),
           ),
         ],

@@ -48,6 +48,7 @@ void main() {
     sqfliteFfiInit();
     databaseFactory = databaseFactoryFfi;
     SharedPreferences.setMockInitialValues({
+      'outlet_cloud_env': 'development',
       'outlet_cloud_api_url': _cloudUrl,
       'outlet_cloud_api_key': _apiKey,
       'outlet_cloud_outlet_id': _outletId,

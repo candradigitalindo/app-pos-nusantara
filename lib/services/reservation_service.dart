@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 
@@ -111,6 +113,7 @@ class ReservationService {
   final _outletService = OutletService();
   final _orderRepo = OrderRepository();
   final _cashierRepo = CashierRepository();
+  final _opening = <String, Future<void>>{};
   final _dio = Dio(BaseOptions(
     connectTimeout: const Duration(seconds: 12),
     receiveTimeout: const Duration(seconds: 12),
@@ -156,7 +159,7 @@ class ReservationService {
   /// Buka reservasi menjadi order di [tableNumber].
   ///
   /// Idempoten: reservasi yang sudah punya order aktif mengembalikan order itu
-  /// (dan melengkapi DP-nya bila sebelumnya gagal tercatat), bukan membuat
+  /// (dan menambah hanya selisih DP tervalidasi), bukan membuat
   /// order kedua. Menu dipetakan lewat product_local_id; yang tidak dikenal
   /// POS dilewati dan dilaporkan di [OpenedReservation.skipped].
   Future<OpenedReservation> openAsOrder({
@@ -164,8 +167,44 @@ class ReservationService {
     required String tableNumber,
     required String cashierName,
   }) async {
-    final existing = await _orderRepo.getOpenOrderByReservation(reservation.id);
+    if (reservation.id.isEmpty) throw Exception('ID reservasi tidak tersedia');
+    // Satu reservasi bisa diketuk ulang sebelum operasi pertama selesai.
+    // Antrekan seluruh proses lookup/create/credit agar order dan DP unik.
+    final previous = _opening[reservation.id];
+    final completion = Completer<void>();
+    _opening[reservation.id] = completion.future;
+    try {
+      if (previous != null) await previous;
+      return await _openAsOrder(
+        reservation: reservation,
+        tableNumber: tableNumber,
+        cashierName: cashierName,
+      );
+    } finally {
+      completion.complete();
+      if (identical(_opening[reservation.id], completion.future)) {
+        _opening.remove(reservation.id);
+      }
+    }
+  }
+
+  Future<OpenedReservation> _openAsOrder({
+    required CloudReservation reservation,
+    required String tableNumber,
+    required String cashierName,
+  }) async {
+    if (reservation.status != 'pending' && reservation.status != 'confirmed') {
+      throw Exception('Reservasi sudah selesai atau dibatalkan. Muat ulang daftar.');
+    }
+    if (!reservation.paidAmount.isFinite || reservation.paidAmount < 0) {
+      throw Exception('Jumlah DP reservasi tidak valid');
+    }
+    final existing = await _orderRepo.getOrderByReservation(reservation.id);
     if (existing != null) {
+      if (existing.isPaid) {
+        throw Exception('Reservasi ini sudah dilunasi di POS. '
+            'Sinkronkan transaksi sebelum membuka daftar reservasi kembali.');
+      }
       await _ensureDpRecorded(existing, reservation, cashierName);
       final fresh = await _orderRepo.getOrderById(existing.id) ?? existing;
       return (order: fresh, skipped: const <String>[]);
@@ -218,25 +257,40 @@ class ReservationService {
     return (order: fresh, skipped: skipped);
   }
 
-  /// Catat uang muka tervalidasi sebagai pembayaran sebagian, sekali saja.
+  /// Credit only the new validated deposit. Older payment rows remain intact
+  /// so their timestamps and methods continue to describe the original money.
   Future<void> _ensureDpRecorded(
       Order order, CloudReservation reservation, String cashierName) async {
-    if (reservation.paidAmount <= 0 || order.isPaid) return;
+    if (order.isPaid) return;
     final db = await AppDatabase.instance.database;
     final already = await db.query(
       'payments',
-      columns: ['id'],
-      where: 'order_id = ? AND payment_method = ?',
-      whereArgs: [order.id, dpMethod],
-      limit: 1,
+      columns: ['amount', 'payment_method'],
+      where: 'order_id = ?',
+      whereArgs: [order.id],
     );
-    if (already.isNotEmpty) return;
+    final recorded = already.fold<double>(
+        0, (sum, payment) => sum + (payment['amount'] as num).toDouble());
+    if ((recorded - order.paidAmount).abs() > 0.01) {
+      throw Exception('Rincian pembayaran sebelumnya belum lengkap. '
+          'Periksa pembayaran sebelum memperbarui DP.');
+    }
+    final credited = already
+        .where((payment) => payment['payment_method'] == dpMethod)
+        .fold<double>(
+            0, (sum, payment) => sum + (payment['amount'] as num).toDouble());
+    final delta = reservation.paidAmount - credited;
+    if (delta < -0.01) {
+      throw Exception('DP pada daftar cloud lebih kecil dari DP yang sudah '
+          'tercatat di POS. Muat ulang dan periksa pembayaran reservasi.');
+    }
+    if (delta <= 0.01) return;
     // splitBillPayment meng-clamp ke sisa tagihan: bila menu di POS lebih
     // murah dari yang dicatat cloud, kelebihan DP tidak hilang di cloud
     // (kewajiban uang muka tetap tercatat di sana sampai direkonsiliasi).
     await _orderRepo.splitBillPayment(
       orderId: order.id,
-      amount: reservation.paidAmount,
+      amount: delta,
       paymentMethod: dpMethod,
       note: 'DP reservasi ${reservation.customerName}'.trim(),
       createdBy: cashierName,

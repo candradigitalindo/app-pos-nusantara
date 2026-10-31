@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../controllers/tables_controller.dart';
 import '../../models/models.dart';
+import '../../services/app_events.dart';
 import '../../theme/theme.dart';
 import '../../utils/currency.dart';
 import '../../widgets/ui/ui.dart';
@@ -14,7 +15,8 @@ class TablesScreen extends StatefulWidget {
   State<TablesScreen> createState() => _TablesScreenState();
 }
 
-class _TablesScreenState extends State<TablesScreen> {
+class _TablesScreenState extends State<TablesScreen>
+    with AppEventsRefresh<TablesScreen> {
   late final TablesController _controller;
   String _searchQuery = '';
   String _filterStatus = '';
@@ -25,7 +27,13 @@ class _TablesScreenState extends State<TablesScreen> {
     _controller = TablesController();
     _controller.addListener(_onStateChanged);
     _controller.loadTables();
+    // Meja bisa terisi/kosong dari perangkat lain (station memesan / membayar)
+    // atau dari layar kasir — ikut menyegar tanpa perlu Muat Ulang manual.
+    listenDataChanges();
   }
+
+  @override
+  void onDataChanged() => _controller.loadTables();
 
   @override
   void deactivate() {
@@ -35,6 +43,7 @@ class _TablesScreenState extends State<TablesScreen> {
 
   @override
   void dispose() {
+    cancelDataChanges();
     _controller.dispose();
     super.dispose();
   }

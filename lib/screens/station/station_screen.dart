@@ -24,6 +24,7 @@ class StationScreen extends StatefulWidget {
 
   /// Ganti Main POS: dikelola StationGate (lepas koneksi → setup → login).
   final VoidCallback? onChangeServer;
+
   const StationScreen(
       {super.key, this.user, this.onLogout, this.onChangeServer});
 
@@ -36,13 +37,13 @@ class _StationScreenState extends State<StationScreen> {
 
   static const _accent = AppColors.moduleKasir;
 
-  // Auto-logout saat idle (mengikuti aturan waiter): tak ada interaksi
-  // selama _idleSeconds → peringatan _warnSeconds detik → terkunci.
-  static const _idleSeconds = 60;
+  // Auto-logout saat idle (sama seperti Main POS): tak ada interaksi selama
+  // _idleSeconds → peringatan _warnSeconds detik → logout sungguhan (bukan
+  // sekadar layar terkunci yang bisa dibuka dengan satu ketukan tanpa PIN).
+  static const _idleSeconds = 10;
   static const _warnSeconds = 10;
   Timer? _idleTimer;
   bool _warningShown = false;
-  bool _locked = false;
 
   @override
   void initState() {
@@ -64,36 +65,31 @@ class _StationScreenState extends State<StationScreen> {
 
   void _resetIdle() {
     _idleTimer?.cancel();
-    if (_locked || _warningShown) return;
+    if (_warningShown) return;
     _idleTimer = Timer(const Duration(seconds: _idleSeconds), _onIdle);
   }
 
   Future<void> _onIdle() async {
-    if (!mounted || _warningShown || _locked) return;
+    if (!mounted || _warningShown) return;
     _warningShown = true;
     final stay = await showDialog<bool>(
       context: context,
       barrierDismissible: false,
-      builder: (_) => const _IdleWarningDialog(seconds: _warnSeconds),
+      builder: (_) => const IdleWarningDialog(seconds: _warnSeconds),
     );
     _warningShown = false;
     if (!mounted) return;
     if (stay == true) {
       _resetIdle(); // waiter masih di sini
     } else {
-      _logout(); // waktu habis → kunci
+      _logout(); // waktu habis → logout
     }
   }
 
   void _logout() {
     _idleTimer?.cancel();
-    _controller.goBackToTables(); // bersihkan keranjang & kembali ke daftar meja
-    setState(() => _locked = true);
-  }
-
-  void _unlock() {
-    setState(() => _locked = false);
-    _resetIdle();
+    _controller.goBackToTables(); // bersihkan keranjang sebelum keluar
+    widget.onLogout?.call();
   }
 
   void _onChange() {
@@ -150,7 +146,7 @@ class _StationScreenState extends State<StationScreen> {
                 children: [
                   AppPageHeader(
                     title: _headerTitle(),
-                    subtitle: inTables ? 'Pilih meja untuk mulai pesan' : null,
+                    subtitle: _headerSubtitle(inTables),
                     icon: Icons.room_service_rounded,
                     accent: _accent,
                     showBack: !inTables,
@@ -160,12 +156,25 @@ class _StationScreenState extends State<StationScreen> {
                   Expanded(child: _body()),
                 ],
               ),
-              if (_locked) _lockOverlay(),
             ],
           ),
         ),
       ),
     );
+  }
+
+  /// Subjudul header: petunjuk di daftar meja, dan ringkasan order berjalan
+  /// saat sedang menambah item (kasir perlu tahu apa yang sudah dipesan).
+  String? _headerSubtitle(bool inTables) {
+    if (inTables) return 'Pilih meja untuk mulai pesan';
+    if (_controller.viewMode == 'order' && _controller.isAddingToOrder) {
+      final order = _controller.currentOrder;
+      if (order == null) return null;
+      final count = (order['items'] as List?)?.length ?? 0;
+      final total = (order['total_amount'] as num?)?.toDouble() ?? 0;
+      return 'Sudah dipesan: $count item · ${CurrencyHelper.format(total)}';
+    }
+    return null;
   }
 
   String _headerTitle() {
@@ -205,59 +214,6 @@ class _StationScreenState extends State<StationScreen> {
         ],
       ),
     ];
-  }
-
-  Widget _lockOverlay() {
-    return Positioned.fill(
-      child: GestureDetector(
-        onTap: _unlock,
-        child: DecoratedBox(
-          decoration: const BoxDecoration(
-            gradient: LinearGradient(
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-              colors: AppColors.sidebarGradient,
-            ),
-          ),
-          child: Center(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Container(
-                  width: 96,
-                  height: 96,
-                  decoration: BoxDecoration(
-                    color: Colors.white.withValues(alpha: 0.1),
-                    shape: BoxShape.circle,
-                    border: Border.all(color: Colors.white.withValues(alpha: 0.2)),
-                  ),
-                  child: const Icon(Icons.lock_outline_rounded,
-                      size: 46, color: Colors.white),
-                ),
-                const SizedBox(height: AppSpacing.lg),
-                const Text('Sesi terkunci',
-                    style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 22,
-                        fontWeight: FontWeight.w800)),
-                const SizedBox(height: AppSpacing.xs),
-                Text('Keranjang dikosongkan karena tidak aktif.',
-                    style: TextStyle(
-                        color: Colors.white.withValues(alpha: 0.7), fontSize: 14)),
-                const SizedBox(height: AppSpacing.xl),
-                AppButton(
-                  label: 'Ketuk untuk mulai',
-                  icon: Icons.touch_app_rounded,
-                  accent: _accent,
-                  expanded: false,
-                  onPressed: _unlock,
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
   }
 
   Widget _body() {
@@ -409,18 +365,40 @@ class _StationScreenState extends State<StationScreen> {
             ),
           ),
           Expanded(
-            child: empty
-                ? const EmptyState(
-                    icon: Icons.shopping_cart_outlined,
-                    title: 'Keranjang kosong',
-                    message: 'Pilih menu untuk memulai pesanan.',
-                    accent: _accent,
-                  )
-                : ListView(
+            child: isAdd
+                ? ListView(
                     padding: const EdgeInsets.all(AppSpacing.sm),
-                    children:
-                        _controller.cart.entries.map(_cartItemRow).toList(),
-                  ),
+                    children: [
+                      _existingOrderSummary(),
+                      const SizedBox(height: AppSpacing.sm),
+                      const SectionHeader('Item Baru'),
+                      if (empty)
+                        Padding(
+                          padding: const EdgeInsets.symmetric(
+                              vertical: AppSpacing.md),
+                          child: Text(
+                            'Pilih menu untuk menambah item ke order ini.',
+                            textAlign: TextAlign.center,
+                            style: AppType.caption
+                                .copyWith(color: AppColors.textTertiary),
+                          ),
+                        )
+                      else
+                        ..._controller.cart.entries.map(_cartItemRow),
+                    ],
+                  )
+                : empty
+                    ? const EmptyState(
+                        icon: Icons.shopping_cart_outlined,
+                        title: 'Keranjang kosong',
+                        message: 'Pilih menu untuk memulai pesanan.',
+                        accent: _accent,
+                      )
+                    : ListView(
+                        padding: const EdgeInsets.all(AppSpacing.sm),
+                        children:
+                            _controller.cart.entries.map(_cartItemRow).toList(),
+                      ),
           ),
           if (!empty)
             SafeArea(
@@ -456,6 +434,113 @@ class _StationScreenState extends State<StationScreen> {
                 ),
               ),
             ),
+        ],
+      ),
+    );
+  }
+
+  /// Ringkasan item yang SUDAH masuk ke order aktif — tampil saat mode tambah
+  /// item supaya penambah tahu apa yang sudah dipesan sebelumnya.
+  Widget _existingOrderSummary() {
+    final order = _controller.currentOrder;
+    if (order == null) return const SizedBox.shrink();
+    final items = (order['items'] as List?) ?? const [];
+    final total = (order['total_amount'] as num?)?.toDouble() ?? 0;
+
+    return Container(
+      padding: const EdgeInsets.all(AppSpacing.sm),
+      decoration: BoxDecoration(
+        color: AppColors.surfaceMuted,
+        borderRadius: AppRadius.rSm,
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.receipt_long_rounded,
+                  size: 16, color: AppColors.textTertiary),
+              const SizedBox(width: AppSpacing.xs),
+              Text('Pesanan Sebelumnya',
+                  style:
+                      AppType.label.copyWith(color: AppColors.textSecondary)),
+              const Spacer(),
+              Text('${items.length} item',
+                  style: AppType.caption
+                      .copyWith(color: AppColors.textTertiary)),
+            ],
+          ),
+          if (items.isEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: AppSpacing.xs),
+              child: Text('Belum ada item terkirim.',
+                  style: AppType.caption
+                      .copyWith(color: AppColors.textTertiary)),
+            )
+          else
+            ...items.map((it) {
+              final m = it as Map;
+              final qty = (m['qty'] as num?)?.toInt() ?? 0;
+              final price = (m['price'] as num?)?.toDouble() ?? 0;
+              final notes = m['notes'] as String?;
+              final status = m['item_status'] as String? ?? '';
+              return Padding(
+                padding: const EdgeInsets.only(top: AppSpacing.xs),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SizedBox(
+                      width: 30,
+                      child: Text('${qty}x',
+                          style: AppType.caption.copyWith(
+                              color: _accent, fontWeight: FontWeight.w700)),
+                    ),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(m['product_name'] as String? ?? '',
+                              style: AppType.bodySm,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis),
+                          if (notes?.isNotEmpty == true)
+                            Text(notes!,
+                                style: AppType.caption
+                                    .copyWith(color: AppColors.textTertiary),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis),
+                        ],
+                      ),
+                    ),
+                    if (status.isNotEmpty) ...[
+                      const SizedBox(width: AppSpacing.xxs),
+                      Text(status,
+                          style: AppType.caption
+                              .copyWith(color: _statusColor(status))),
+                    ],
+                    const SizedBox(width: AppSpacing.xs),
+                    Text(CurrencyHelper.format(qty * price),
+                        style: AppType.caption
+                            .copyWith(color: AppColors.textSecondary)),
+                  ],
+                ),
+              );
+            }),
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: AppSpacing.xs),
+            child: Divider(height: 1, color: AppColors.border),
+          ),
+          Row(
+            children: [
+              Text('Total sebelumnya', style: AppType.caption),
+              const Spacer(),
+              Text(CurrencyHelper.format(total),
+                  style: AppType.label.copyWith(color: AppColors.textPrimary)),
+            ],
+          ),
         ],
       ),
     );
@@ -548,11 +633,15 @@ class _StationScreenState extends State<StationScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Text(p.name,
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                  style: AppType.title),
-              const SizedBox(height: AppSpacing.xs),
+              // Flexible + jarak kecil: nama 2 baris (mis. "Nasi Goreng
+              // Spesial") tak lagi melewati tinggi kartu.
+              Flexible(
+                child: Text(p.name,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: AppType.title),
+              ),
+              const SizedBox(height: AppSpacing.xxs),
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
@@ -636,12 +725,19 @@ class _StationScreenState extends State<StationScreen> {
   }
 
   /// Dialog PIN: verifikasi ke Main POS, kembalikan nama waiter (atau null).
-  Future<String?> _showWaiterPinDialog() {
-    return showDialog<String>(
+  ///
+  /// Timer idle dijeda selama dialog terbuka — sentuhan di dalam dialog tak
+  /// sampai ke Listener layar, jadi tanpa ini waiter bisa ter-logout justru
+  /// saat sedang mengetik PIN.
+  Future<String?> _showWaiterPinDialog() async {
+    _idleTimer?.cancel();
+    final name = await showDialog<String>(
       context: context,
       barrierDismissible: false,
       builder: (ctx) => _WaiterPinDialog(controller: _controller),
     );
+    _resetIdle();
+    return name;
   }
 
   /// Dialog catatan item di keranjang (mis. "tanpa sambal", "level 2").
@@ -764,24 +860,36 @@ class _StationScreenState extends State<StationScreen> {
   }
 
   void _showCartSheet() {
+    final isAdd = _controller.isAddingToOrder;
     showAppModal(
       context,
-      title: 'Pesanan',
+      title: isAdd ? 'Tambah Item' : 'Pesanan',
       icon: Icons.shopping_cart_rounded,
       accent: _accent,
       builder: (_) => ListenableBuilder(
         listenable: _controller,
         builder: (_, __) {
-          if (_controller.cart.isEmpty) {
-            return const Padding(
-              padding: EdgeInsets.symmetric(vertical: AppSpacing.lg),
-              child: Text('Keranjang kosong',
-                  textAlign: TextAlign.center, style: TextStyle(color: AppColors.textTertiary)),
-            );
-          }
+          final cartRows = _controller.cart.isEmpty
+              ? [
+                  const Padding(
+                    padding: EdgeInsets.symmetric(vertical: AppSpacing.lg),
+                    child: Text('Keranjang kosong',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(color: AppColors.textTertiary)),
+                  )
+                ]
+              : _controller.cart.entries.map(_cartItemRow).toList();
           return Column(
             mainAxisSize: MainAxisSize.min,
-            children: _controller.cart.entries.map(_cartItemRow).toList(),
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              if (isAdd) ...[
+                _existingOrderSummary(),
+                const SizedBox(height: AppSpacing.sm),
+                const SectionHeader('Item Baru'),
+              ],
+              ...cartRows,
+            ],
           );
         },
       ),
@@ -1014,6 +1122,7 @@ class _StationScreenState extends State<StationScreen> {
   /// Otorisasi manajer: PIN → verifikasi ke Main POS → cek role. Return nama
   /// authorizer, atau null bila batal/gagal/tak berwenang.
   Future<String?> _managerAuth() async {
+    _idleTimer?.cancel(); // jangan logout saat manajer sedang mengetik PIN
     final ctrl = TextEditingController();
     final pin = await showAppModal<String>(
       context,
@@ -1046,6 +1155,7 @@ class _StationScreenState extends State<StationScreen> {
         ],
       ),
     );
+    _resetIdle();
     if (pin == null || pin.isEmpty || !mounted) return null;
     final user = await _controller.authPin(pin);
     if (!mounted) return null;
@@ -1336,86 +1446,6 @@ class _StationScreenState extends State<StationScreen> {
 
 /// Dialog peringatan idle: hitung mundur [seconds] detik. Pop true bila waiter
 /// menekan "Saya masih di sini"; pop false otomatis saat waktu habis.
-class _IdleWarningDialog extends StatefulWidget {
-  final int seconds;
-  const _IdleWarningDialog({required this.seconds});
-
-  @override
-  State<_IdleWarningDialog> createState() => _IdleWarningDialogState();
-}
-
-class _IdleWarningDialogState extends State<_IdleWarningDialog> {
-  late int _remaining = widget.seconds;
-  Timer? _timer;
-
-  @override
-  void initState() {
-    super.initState();
-    _timer = Timer.periodic(const Duration(seconds: 1), (t) {
-      if (!mounted) return;
-      setState(() => _remaining--);
-      if (_remaining <= 0) {
-        t.cancel();
-        Navigator.pop(context, false); // waktu habis → logout
-      }
-    });
-  }
-
-  @override
-  void dispose() {
-    _timer?.cancel();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Dialog(
-      backgroundColor: AppColors.surface,
-      shape: const RoundedRectangleBorder(borderRadius: AppRadius.rXxl),
-      child: Padding(
-        padding: const EdgeInsets.all(AppSpacing.xl),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            SizedBox(
-              width: 72,
-              height: 72,
-              child: Stack(
-                alignment: Alignment.center,
-                children: [
-                  CircularProgressIndicator(
-                    value: _remaining / widget.seconds,
-                    color: AppColors.warning,
-                    backgroundColor: AppColors.warningSoft,
-                    strokeWidth: 5,
-                  ),
-                  Text('$_remaining',
-                      style: AppType.h2.copyWith(color: AppColors.warning)),
-                ],
-              ),
-            ),
-            const SizedBox(height: AppSpacing.md),
-            Text('Masih di sana?', style: AppType.h3),
-            const SizedBox(height: AppSpacing.xs),
-            Text(
-              'Sesi akan terkunci karena tidak aktif.',
-              textAlign: TextAlign.center,
-              style: AppType.body.copyWith(color: AppColors.textSecondary),
-            ),
-            const SizedBox(height: AppSpacing.lg),
-            AppButton(
-              label: 'Saya masih di sini',
-              icon: Icons.touch_app_rounded,
-              accent: AppColors.moduleKasir,
-              onPressed: () => Navigator.pop(context, true),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
 /// Dialog verifikasi PIN waiter sebelum mengirim order/tambahan.
 class _WaiterPinDialog extends StatefulWidget {
   final StationController controller;
@@ -1425,20 +1455,34 @@ class _WaiterPinDialog extends StatefulWidget {
   State<_WaiterPinDialog> createState() => _WaiterPinDialogState();
 }
 
+/// Cara memasukkan PIN disamakan dengan LOGIN station: digit ke-4 langsung
+/// diproses (tanpa tombol Verifikasi), dan PIN salah menahan dialog ini —
+/// isian dikosongkan + pesan error, bukan menutup dialog.
 class _WaiterPinDialogState extends State<_WaiterPinDialog> {
   final _ctrl = TextEditingController();
+  final _focus = FocusNode();
   bool _verifying = false;
   String? _error;
+
+  /// PIN selalu 4 digit (lihat Manajemen User).
+  static const _pinLength = 4;
 
   @override
   void dispose() {
     _ctrl.dispose();
+    _focus.dispose();
     super.dispose();
+  }
+
+  /// Dipanggil tiap ketikan: begitu genap 4 digit, langsung verifikasi.
+  void _onChanged(String value) {
+    if (_error != null) setState(() => _error = null);
+    if (value.length == _pinLength) _verify();
   }
 
   Future<void> _verify() async {
     final pin = _ctrl.text.trim();
-    if (pin.isEmpty) return;
+    if (pin.isEmpty || _verifying) return;
     setState(() {
       _verifying = true;
       _error = null;
@@ -1447,21 +1491,27 @@ class _WaiterPinDialogState extends State<_WaiterPinDialog> {
       final user = await widget.controller.authPin(pin);
       if (!mounted) return;
       if (user == null) {
-        setState(() {
-          _verifying = false;
-          _error = 'PIN salah';
-          _ctrl.clear();
-        });
+        _failed('PIN salah');
         return;
       }
       Navigator.pop(context, user['full_name'] as String? ?? 'Waiter');
     } catch (e) {
       if (!mounted) return;
-      setState(() {
-        _verifying = false;
-        _error = 'Gagal verifikasi: $e';
-      });
+      _failed('Gagal verifikasi: $e');
     }
+  }
+
+  /// PIN salah → tetap di dialog ini, isian dikosongkan agar bisa langsung
+  /// mengetik ulang (sama seperti layar login).
+  void _failed(String message) {
+    setState(() {
+      _verifying = false;
+      _error = message;
+      _ctrl.clear();
+    });
+    // Kembalikan fokus + keyboard supaya waiter bisa langsung mengetik ulang
+    // tanpa menyentuh kolomnya lagi (sama seperti layar login).
+    _focus.requestFocus();
   }
 
   @override
@@ -1490,11 +1540,13 @@ class _WaiterPinDialogState extends State<_WaiterPinDialog> {
             const SizedBox(height: AppSpacing.lg),
             TextField(
               controller: _ctrl,
+              focusNode: _focus,
               autofocus: true,
+              enabled: !_verifying,
               obscureText: true,
               keyboardType: TextInputType.number,
               textAlign: TextAlign.center,
-              maxLength: 6,
+              maxLength: _pinLength,
               style: const TextStyle(fontSize: 24, letterSpacing: 8),
               decoration: InputDecoration(
                 counterText: '',
@@ -1502,28 +1554,27 @@ class _WaiterPinDialogState extends State<_WaiterPinDialog> {
                 border: const OutlineInputBorder(),
                 errorText: _error,
               ),
+              onChanged: _onChanged,
               onSubmitted: (_) => _verify(),
             ),
-            const SizedBox(height: AppSpacing.md),
-            Row(
-              children: [
-                Expanded(
-                  child: AppButton.neutral(
-                    'Batal',
-                    onPressed:
-                        _verifying ? null : () => Navigator.pop(context),
-                  ),
-                ),
-                const SizedBox(width: AppSpacing.sm),
-                Expanded(
-                  child: AppButton(
-                    label: 'Verifikasi',
-                    accent: AppColors.moduleKasir,
-                    loading: _verifying,
-                    onPressed: _verifying ? null : _verify,
-                  ),
-                ),
-              ],
+            const SizedBox(height: AppSpacing.sm),
+            SizedBox(
+              height: 20,
+              child: Center(
+                child: _verifying
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(
+                            strokeWidth: 2.4, color: AppColors.moduleKasir),
+                      )
+                    : null,
+              ),
+            ),
+            const SizedBox(height: AppSpacing.sm),
+            AppButton.neutral(
+              'Batal',
+              onPressed: _verifying ? null : () => Navigator.pop(context),
             ),
           ],
         ),

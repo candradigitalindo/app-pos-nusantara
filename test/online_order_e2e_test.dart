@@ -57,6 +57,7 @@ void main() {
 
     // Prefs harus dipasang SEBELUM layanan apa pun membacanya.
     SharedPreferences.setMockInitialValues({
+      'outlet_cloud_env': 'development',
       'outlet_cloud_api_url': _cloudUrl,
       'outlet_cloud_api_key': _apiKey,
       'outlet_cloud_outlet_id': _outletId,

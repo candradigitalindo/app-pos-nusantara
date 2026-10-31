@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart' hide Category;
 
 import '../models/models.dart';
@@ -6,6 +8,7 @@ import '../repositories/order_repository.dart';
 import '../repositories/product_repository.dart';
 import '../repositories/table_repository.dart';
 import '../services/auth_service.dart';
+import '../services/cash_drawer_service.dart';
 import '../services/outlet_service.dart';
 import '../services/print_queue_service.dart';
 import '../services/printer_service.dart';
@@ -220,6 +223,39 @@ class CashierController extends ChangeNotifier {
     }
   }
 
+  /// Segarkan data yang bisa berubah dari perangkat/layar LAIN (station
+  /// memesan, waiter menambah item, order dibayar) TANPA mengganggu keranjang
+  /// yang sedang disusun kasir: hanya daftar meja, status shift, dan isi order
+  /// yang sedang dibuka yang dimuat ulang.
+  Future<void> refreshExternal() async {
+    try {
+      final tables = await _tableRepo.getTables();
+      final shift = await _cashierRepo.getActiveShift();
+      _setState(_state.copyWith(
+        tables: tables,
+        activeShift: shift,
+        clearActiveShift: shift == null,
+      ));
+
+      final orderId = _state.currentOrder?.id;
+      if (orderId == null) return;
+      final order = await _orderRepo.getOrderById(orderId);
+      if (order == null || order.isPaid) {
+        // Order sudah dibayar/void dari perangkat lain → kosongkan panel.
+        _setState(_state.copyWith(
+          clearCurrentOrder: true,
+          clearSelectedTable: true,
+          orderItems: [],
+          orderCharges: [],
+        ));
+        return;
+      }
+      await _loadOrderItems(orderId);
+    } catch (_) {
+      // Diamkan: ini penyegaran latar belakang, bukan aksi pengguna.
+    }
+  }
+
   Future<void> selectCategory(Category? cat) async {
     if (_state.isLoading) return; // ignore rapid taps while loading
     _setState(_state.copyWith(
@@ -314,6 +350,9 @@ class CashierController extends ChangeNotifier {
       ));
     }
   }
+
+  /// Meja yang tagihannya belum lunas — syarat tutup kasir.
+  Future<List<String>> unpaidTables() => _cashierRepo.unpaidTables();
 
   Future<void> closeShift() async {
     final shift = _state.activeShift;
@@ -637,6 +676,10 @@ class CashierController extends ChangeNotifier {
       _printReceiptBackground(
           result, orderSnapshot, orderItemsSnapshot, charges);
 
+      // Laci kasir: buka otomatis setelah lunas (ikut Pengaturan Printer).
+      unawaited(CashDrawerService.instance.openAfterPayment(
+          paymentMethod: method));
+
       _setState(_state.copyWith(
         currentOrder: null,
         clearCurrentOrder: true,
@@ -726,6 +769,9 @@ class CashierController extends ChangeNotifier {
           itemsSnapshot,
           charges,
         );
+        // Laci kasir: bagian terakhir split/gabung bayar → tagihan lunas.
+        unawaited(CashDrawerService.instance.openAfterPayment(
+            paymentMethod: method));
         _setState(_state.copyWith(
           currentOrder: null,
           clearCurrentOrder: true,

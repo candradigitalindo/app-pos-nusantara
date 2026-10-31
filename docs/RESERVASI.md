@@ -36,6 +36,10 @@ Auth memakai API key outlet, sama seperti sync lain.
   kasir di dialog bayar.
 - Nominalnya = `paid_amount` dari cloud (uang muka yang sudah divalidasi admin),
   dicatat lewat `splitBillPayment` sehingga sisa tagihan langsung berkurang.
+  Jika DP bertambah setelah order dibuka, pilih reservasi itu lagi: POS kembali
+  ke meja yang sama dan mencatat hanya selisih DP. Pembayaran lama beserta
+  waktunya tetap tersimpan. Perubahan DP tidak ditarik otomatis saat pembayaran
+  offline; muat ulang daftar reservasi untuk mengambil tambahan yang divalidasi.
 - Uang DP tidak ada di laci: laporan shift menampilkannya sebagai baris
   "DP Reservasi" terpisah dari tunai. Di cloud, baris ini dikecualikan dari
   penerimaan kas hari kunjungan karena uangnya sudah masuk saat DP.
@@ -45,8 +49,14 @@ Auth memakai API key outlet, sama seperti sync lain.
 ## Idempotensi & kegagalan
 
 - Membuka reservasi yang sudah punya order aktif mengembalikan order itu, dan
-  melengkapi DP-nya bila sebelumnya gagal tercatat — tidak pernah membuat order
-  kedua atau DP ganda.
+  melengkapi selisih DP-nya. Pembukaan bersamaan di perangkat utama diantrekan
+  per reservasi agar tidak membuat order atau DP ganda.
+- Reservasi yang sudah lunas di POS ditolak bila masih muncul pada daftar cloud
+  yang tertinggal. Sinkronkan transaksi sebelum memuat ulang daftar.
+- Jika saldo pembayaran lokal tidak cocok dengan rincian pembayaran (misalnya
+  sesudah restore yang belum lengkap), pembaruan DP ditolak untuk diperiksa.
+  Nilai DP cloud yang lebih kecil dari kredit lokal juga perlu diperiksa;
+  sistem tidak menghapus atau mengurangi pembayaran lama secara otomatis.
 - Menu reservasi yang tidak dikenal POS (produk terhapus / belum tersinkron)
   dilewati dan disebutkan di notifikasi agar kasir menambahkannya manual.
   Bila tidak ada satu pun yang dikenal, pembukaan ditolak.
@@ -55,8 +65,7 @@ Auth memakai API key outlet, sama seperti sync lain.
 
 ## Menjalankan tes
 
-Tes berbasis SQLite memakai satu berkas `pos_resto.db` yang sama, jadi jalankan
-berurutan agar tidak saling menimpa:
+Tes lokal memakai direktori SQLite sementara yang terpisah:
 
 ```
 flutter test --concurrency=1 test/migration_test.dart test/reservation_open_test.dart

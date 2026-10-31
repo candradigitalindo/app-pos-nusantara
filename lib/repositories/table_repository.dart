@@ -1,4 +1,5 @@
 import '../database/database.dart';
+import '../services/app_events.dart';
 import '../models/models.dart';
 import '../utils/ulid.dart';
 
@@ -48,6 +49,7 @@ class TableRepository {
       where: 'id = ?',
       whereArgs: [tableId],
     );
+    notifyDataChanged('order_updated');
   }
 
   Future<void> updateTableStatus(String tableNumber, String status) async {
@@ -60,6 +62,7 @@ class TableRepository {
       where: 'table_number = ?',
       whereArgs: [tableNumber],
     );
+    notifyDataChanged('order_updated');
   }
 
   Future<void> deleteTable(String id) async {

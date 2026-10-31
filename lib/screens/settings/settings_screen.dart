@@ -12,6 +12,7 @@ import '../../repositories/order_repository.dart';
 import '../../services/cloud_sync_service.dart';
 import '../../services/device_role_service.dart';
 import '../../services/logo_service.dart';
+import '../../services/outlet_service.dart';
 import '../../theme/theme.dart';
 import '../../widgets/ui/ui.dart';
 import 'print_queue_screen.dart';
@@ -47,6 +48,10 @@ class _SettingsScreenState extends State<SettingsScreen>
   final _apiUrlCtrl = TextEditingController();
   final _apiKeyCtrl = TextEditingController();
   final _outletIdCtrl = TextEditingController();
+  CloudEnv _cloudEnv = CloudEnv.production;
+  /// URL terakhir yang diisi saat mode development, dipakai lagi kalau
+  /// pengguna bolak-balik production ↔ development.
+  String _devApiUrl = '';
   bool _syncEnabled = false;
   int _syncInterval = 5;
   bool _testingConnection = false;
@@ -162,6 +167,8 @@ class _SettingsScreenState extends State<SettingsScreen>
     _apiKeyCtrl.text = info.cloudApiKey;
     _outletIdCtrl.text = info.cloudOutletId;
     setState(() {
+      _cloudEnv = info.cloudEnv;
+      if (_cloudEnv == CloudEnv.development) _devApiUrl = info.cloudApiUrl;
       _syncEnabled = info.syncEnabled;
       _syncInterval = info.syncInterval;
     });
@@ -537,11 +544,14 @@ class _SettingsScreenState extends State<SettingsScreen>
                             fontWeight: FontWeight.w700,
                             color: AppColors.textPrimary),
                       ),
-                      if (isConfigured) ...[
-                        const SizedBox(height: 2),
-                        Text('Sync terakhir: ${_formatLastSync(_lastSyncAt)}',
-                            style: AppType.caption),
-                      ],
+                      const SizedBox(height: 2),
+                      Text(
+                        isConfigured
+                            ? 'Mode ${_cloudEnv.label} • Sync terakhir: '
+                                '${_formatLastSync(_lastSyncAt)}'
+                            : 'Mode ${_cloudEnv.label}',
+                        style: AppType.caption,
+                      ),
                     ],
                   ),
                 ),
@@ -554,32 +564,13 @@ class _SettingsScreenState extends State<SettingsScreen>
           ),
           const SizedBox(height: AppSpacing.md),
           _group([
-            Padding(
-              padding: const EdgeInsets.symmetric(
-                  horizontal: AppSpacing.md, vertical: AppSpacing.sm),
-              child: Row(
-                children: [
-                  const IconBadge(
-                      icon: Icons.cloud_rounded, color: _accent, size: 40),
-                  const SizedBox(width: AppSpacing.sm),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text('URL Server Cloud',
-                            style: AppType.caption.copyWith(
-                                color: AppColors.textTertiary)),
-                        const SizedBox(height: 2),
-                        Text(
-                          _apiUrlCtrl.text.isEmpty ? '-' : _apiUrlCtrl.text,
-                          style: AppType.body,
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
-            ),
+            _envRow(),
+            _div(),
+            if (_cloudEnv == CloudEnv.production)
+              _readonlyUrlRow()
+            else
+              _field(_apiUrlCtrl, 'URL Server Cloud', Icons.cloud_rounded,
+                  keyboardType: TextInputType.url),
             _div(),
             _field(_apiKeyCtrl, 'API Key', Icons.vpn_key_rounded),
             _div(),
@@ -628,9 +619,24 @@ class _SettingsScreenState extends State<SettingsScreen>
   }
 
   Future<void> _saveAndConnect() async {
+    final url = _cloudEnv == CloudEnv.production
+        ? OutletService.productionCloudApiUrl
+        : _apiUrlCtrl.text.trim();
+    if (_cloudEnv == CloudEnv.development && !_isValidCloudUrl(url)) {
+      showAppSnack(
+        context,
+        'URL server tidak valid. Contoh: http://192.168.1.10:8080',
+        isError: true,
+      );
+      return;
+    }
+    if (_cloudEnv == CloudEnv.development) _devApiUrl = url;
+    _apiUrlCtrl.text = url;
+
     // Simpan dulu
     await _controller.saveCloud(
-      cloudApiUrl: _apiUrlCtrl.text.trim(),
+      cloudEnv: _cloudEnv,
+      cloudApiUrl: url,
       cloudApiKey: _apiKeyCtrl.text.trim(),
       cloudOutletId: _outletIdCtrl.text.trim(),
       syncEnabled: _syncEnabled,
@@ -663,6 +669,144 @@ class _SettingsScreenState extends State<SettingsScreen>
               '${result['deleted_categories'] ?? 0} kategori)'
           : 'Tersimpan, tapi koneksi gagal: ${result['error']}',
       isError: !ok,
+    );
+  }
+
+  bool _isValidCloudUrl(String url) {
+    final uri = Uri.tryParse(url);
+    return uri != null &&
+        (uri.isScheme('http') || uri.isScheme('https')) &&
+        uri.host.isNotEmpty;
+  }
+
+  void _setCloudEnv(CloudEnv env) {
+    if (_cloudEnv == env) return;
+    setState(() {
+      if (_cloudEnv == CloudEnv.development) {
+        _devApiUrl = _apiUrlCtrl.text.trim();
+      }
+      _cloudEnv = env;
+      _apiUrlCtrl.text = env == CloudEnv.production
+          ? OutletService.productionCloudApiUrl
+          : (_devApiUrl == OutletService.productionCloudApiUrl
+              ? ''
+              : _devApiUrl);
+    });
+  }
+
+  Widget _envRow() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(
+          horizontal: AppSpacing.md, vertical: AppSpacing.sm),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const IconBadge(icon: Icons.dns_rounded, color: _accent, size: 40),
+          const SizedBox(width: AppSpacing.sm),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Mode Server', style: AppType.title),
+                Text(
+                  _cloudEnv == CloudEnv.production
+                      ? 'URL terkunci ke server resmi'
+                      : 'Isi URL server sendiri untuk pengujian',
+                  style: AppType.caption,
+                ),
+                const SizedBox(height: AppSpacing.xs),
+                Row(
+                  children: [
+                    Expanded(
+                      child: _envChip(
+                          CloudEnv.production, Icons.verified_rounded),
+                    ),
+                    const SizedBox(width: AppSpacing.xs),
+                    Expanded(
+                      child: _envChip(
+                          CloudEnv.development, Icons.code_rounded),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _envChip(CloudEnv env, IconData icon) {
+    final selected = _cloudEnv == env;
+    final color =
+        env == CloudEnv.production ? AppColors.success : AppColors.warning;
+    return GestureDetector(
+      onTap: () => _setCloudEnv(env),
+      child: Container(
+        padding: const EdgeInsets.symmetric(
+            horizontal: AppSpacing.sm, vertical: AppSpacing.xs),
+        decoration: BoxDecoration(
+          color: AppColors.soft(color, selected ? 0.16 : 0.06),
+          borderRadius: AppRadius.rSm,
+          border: Border.all(
+            color: AppColors.soft(color, selected ? 0.48 : 0.16),
+            width: selected ? 1.5 : 1,
+          ),
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(icon,
+                size: 16,
+                color: selected ? color : AppColors.textTertiary),
+            const SizedBox(width: 6),
+            Flexible(
+              child: Text(
+                env.label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: AppType.label.copyWith(
+                  color: selected ? color : AppColors.textSecondary,
+                  fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _readonlyUrlRow() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(
+          horizontal: AppSpacing.md, vertical: AppSpacing.sm),
+      child: Row(
+        children: [
+          const IconBadge(
+              icon: Icons.cloud_rounded, color: _accent, size: 40),
+          const SizedBox(width: AppSpacing.sm),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('URL Server Cloud',
+                    style: AppType.caption
+                        .copyWith(color: AppColors.textTertiary)),
+                const SizedBox(height: 2),
+                Text(
+                  _apiUrlCtrl.text.isEmpty
+                      ? OutletService.productionCloudApiUrl
+                      : _apiUrlCtrl.text,
+                  style: AppType.body,
+                ),
+              ],
+            ),
+          ),
+          const Icon(Icons.lock_rounded,
+              size: 16, color: AppColors.textTertiary),
+        ],
+      ),
     );
   }
 

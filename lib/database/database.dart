@@ -32,7 +32,7 @@ class AppDatabase {
 
     return openDatabase(
       path,
-      version: 13,
+      version: 14,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
       onConfigure: _onConfigure,
@@ -172,6 +172,11 @@ class AppDatabase {
       await db.execute(
         'CREATE INDEX IF NOT EXISTS idx_payments_order_id ON payments(order_id)',
       );
+    }
+    if (oldVersion < 14) {
+      // Simpan identitas menu saat pesanan dibuat. Baris lama tetap NULL:
+      // nama dapat berubah atau dipakai beberapa produk, jadi jangan ditebak.
+      await db.execute('ALTER TABLE order_items ADD COLUMN product_id TEXT');
     }
   }
 
@@ -390,6 +395,7 @@ class AppDatabase {
       CREATE TABLE IF NOT EXISTS order_items (
         id TEXT PRIMARY KEY CHECK (length(id) = 26),
         order_id TEXT NOT NULL,
+        product_id TEXT,
         product_name TEXT NOT NULL,
         category_id TEXT,
         qty INTEGER NOT NULL CHECK (qty > 0),

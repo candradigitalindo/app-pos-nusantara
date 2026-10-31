@@ -1,6 +1,7 @@
 import '../database/database.dart';
 import '../models/models.dart';
 import '../utils/ulid.dart';
+import 'order_repository.dart';
 import 'sync_queue_repository.dart';
 
 class CashierRepository {
@@ -49,6 +50,73 @@ class CashierRepository {
     return shift;
   }
 
+  /// Meja yang tagihannya BELUM lunas (termasuk "sebagian terbayar"), DITAMBAH
+  /// Meja Titipan bila masih ada item tertitip di sana. Order yang sudah
+  /// di-void tidak dihitung.
+  ///
+  /// Dipakai sebagai syarat tutup kasir: laci tidak boleh ditutup selama masih
+  /// ada tagihan berjalan atau item menggantung di titipan, supaya laporan
+  /// shift & setoran kas tidak menyisakan pekerjaan.
+  Future<List<String>> unpaidTables() async {
+    final rows = await _db.query(
+      'orders',
+      columns: ['table_number'],
+      where: "payment_status != 'paid' AND voided_at IS NULL AND is_holding = 0",
+      orderBy: 'created_at ASC',
+    );
+    final tables = <String>[];
+    for (final r in rows) {
+      final t = (r['table_number'] as String?) ?? '';
+      if (t.isNotEmpty && !tables.contains(t)) tables.add(t);
+    }
+
+    // Meja Titipan: hanya menghalangi bila BENAR-BENAR masih ada isinya —
+    // order titipan yang sudah kosong (semua item ditarik kembali) diabaikan.
+    final holding = await _db.query(
+      'orders',
+      columns: ['id'],
+      where: "is_holding = 1 AND payment_status != 'paid' AND voided_at IS NULL",
+      limit: 1,
+    );
+    if (holding.isNotEmpty) {
+      final items = await _db.query(
+        'order_items',
+        columns: ['id'],
+        where: 'order_id = ?',
+        whereArgs: [holding.first['id']],
+        limit: 1,
+      );
+      if (items.isNotEmpty) tables.add(OrderRepository.holdingTableLabel);
+    }
+    return tables;
+  }
+
+  /// Ringkasan meja untuk pesan error (maksimal 3 nomor, sisanya diringkas).
+  static String describeUnpaidTables(List<String> tables) {
+    if (tables.length <= 3) {
+      return tables.map((t) => 'Meja $t').join(', ');
+    }
+    final head = tables.take(3).map((t) => 'Meja $t').join(', ');
+    return '$head, +${tables.length - 3} lainnya';
+  }
+
+  /// Kalimat alasan kenapa kasir belum boleh ditutup. Tagihan meja dan item
+  /// tertitip disebut terpisah supaya kasir tahu persis apa yang harus
+  /// diselesaikan.
+  static String unpaidBlockMessage(List<String> tables) {
+    final holding =
+        tables.where((t) => t == OrderRepository.holdingTableLabel).isNotEmpty;
+    final bills =
+        tables.where((t) => t != OrderRepository.holdingTableLabel).toList();
+    final parts = <String>[];
+    if (bills.isNotEmpty) {
+      parts.add('${bills.length} tagihan belum dibayar '
+          '(${describeUnpaidTables(bills)})');
+    }
+    if (holding) parts.add('item yang masih tertitip di Meja Titipan');
+    return 'Masih ada ${parts.join(' dan ')}.';
+  }
+
   Future<CashierShift> closeShift({
     required String shiftId,
     required String closedBy,
@@ -65,6 +133,15 @@ class CashierRepository {
     final shift = await _getShiftById(shiftId);
     if (shift == null) throw Exception('Shift tidak ditemukan');
     if (!shift.isOpen) throw Exception('Shift sudah ditutup');
+
+    // Syarat tutup kasir: semua tagihan harus selesai dibayar dulu. Dicek di
+    // sini (bukan hanya di layar) supaya berlaku untuk SEMUA jalur — kasir
+    // utama maupun endpoint station.
+    final unpaid = await unpaidTables();
+    if (unpaid.isNotEmpty) {
+      throw Exception('${unpaidBlockMessage(unpaid)} '
+          'Selesaikan dulu sebelum tutup kasir.');
+    }
 
     final totals = await _calculateShiftTotals(shiftId);
 

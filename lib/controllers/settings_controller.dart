@@ -111,11 +111,16 @@ class SettingsController extends ChangeNotifier {
     String? cloudOutletId,
     required bool syncEnabled,
     required int syncInterval,
+    CloudEnv cloudEnv = CloudEnv.production,
   }) async {
     _setState(_state.copyWith(isSaving: true, clearError: true));
     try {
+      final effectiveUrl = cloudEnv == CloudEnv.production
+          ? OutletService.productionCloudApiUrl
+          : cloudApiUrl.trim();
       await _outletService.saveCloudSettings(
-        cloudApiUrl: cloudApiUrl,
+        cloudEnv: cloudEnv,
+        cloudApiUrl: effectiveUrl,
         cloudApiKey: cloudApiKey,
         cloudOutletId: cloudOutletId,
         syncEnabled: syncEnabled,
@@ -123,7 +128,8 @@ class SettingsController extends ChangeNotifier {
       );
       _setState(_state.copyWith(
         outletInfo: _state.outletInfo.copyWith(
-          cloudApiUrl: cloudApiUrl,
+          cloudEnv: cloudEnv,
+          cloudApiUrl: effectiveUrl,
           cloudApiKey: cloudApiKey,
           cloudOutletId: cloudOutletId,
           syncEnabled: syncEnabled,

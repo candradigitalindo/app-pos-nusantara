@@ -1,8 +1,11 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 
 import '../models/models.dart';
 import '../repositories/order_repository.dart';
 import '../services/auth_service.dart';
+import '../services/cash_drawer_service.dart';
 import '../services/outlet_service.dart';
 import '../services/print_queue_service.dart';
 import '../services/printer_service.dart';
@@ -142,6 +145,11 @@ class TransactionsController extends ChangeNotifier {
 
   /// Nama pihak yang mengotorisasi dari [pin], atau null bila tidak berwenang.
   /// Sama dengan kasir: PIN void bersama ATAU PIN user admin/manager/svp.
+  /// Verifikasi PIN otorisasi (Admin/Manager/SVP atau PIN void outlet) tanpa
+  /// menjalankan aksi apa pun — dipakai layar untuk menggerbangi aksi kasir
+  /// (Split Bill / Gabung Bayar) yang dijalankan dari daftar transaksi.
+  Future<String?> authorize(String pin) => _authorizer(pin);
+
   Future<String?> _authorizer(String pin) async {
     final stored = await _outletService.getVoidPin();
     if (pin == stored) {
@@ -214,6 +222,9 @@ class TransactionsController extends ChangeNotifier {
 
       final charges = await _orderRepo.getOrderCharges(orderId);
       await _printReceipt(order, items, charges, result, authorizer);
+      // Laci kasir: buka otomatis setelah lunas (ikut Pengaturan Printer).
+      unawaited(CashDrawerService.instance
+          .openAfterPayment(paymentMethod: paymentMethod));
       await loadOrders(reset: true);
       return result;
     } catch (e) {

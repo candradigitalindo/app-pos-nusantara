@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../controllers/kitchen_controller.dart';
 import '../../models/models.dart';
+import '../../services/app_events.dart';
 import '../../theme/theme.dart';
 import '../../widgets/ui/ui.dart';
 
@@ -28,13 +29,22 @@ Color _statusColor(String status) {
 }
 
 class KitchenScreen extends StatefulWidget {
-  const KitchenScreen({super.key});
+  /// Sumber data. Null = DB perangkat ini (perangkat utama); mode STATION
+  /// mengisinya dengan `StationKitchenSource` agar datanya dari Main POS.
+  final KitchenDataSource? source;
+
+  /// Aksi tombol kiri-atas. Null = kembali ke layar sebelumnya (perangkat
+  /// utama); di station diisi aksi keluar/logout karena tak ada dashboard.
+  final VoidCallback? onExit;
+
+  const KitchenScreen({super.key, this.source, this.onExit});
 
   @override
   State<KitchenScreen> createState() => _KitchenScreenState();
 }
 
-class _KitchenScreenState extends State<KitchenScreen> {
+class _KitchenScreenState extends State<KitchenScreen>
+    with AppEventsRefresh<KitchenScreen> {
   late final KitchenController _controller;
 
   // 'antrian' (per meja) atau 'batch' (gabung item sama). Default Batch.
@@ -43,10 +53,19 @@ class _KitchenScreenState extends State<KitchenScreen> {
   @override
   void initState() {
     super.initState();
-    _controller = KitchenController();
+    _controller = KitchenController(source: widget.source);
     _controller.addListener(_onStateChanged);
     _controller.loadOrders();
+    // Pesanan baru dari kasir/waiter/station langsung muncul di layar dapur.
+    listenDataChanges();
+    // Mode station: perubahan datang lewat WebSocket Main POS.
+    widget.source?.watch(() {
+      if (mounted) _controller.loadOrders();
+    });
   }
+
+  @override
+  void onDataChanged() => _controller.loadOrders();
 
   @override
   void deactivate() {
@@ -56,6 +75,8 @@ class _KitchenScreenState extends State<KitchenScreen> {
 
   @override
   void dispose() {
+    cancelDataChanges();
+    widget.source?.unwatch();
     _controller.dispose();
     super.dispose();
   }
@@ -129,7 +150,7 @@ class _KitchenScreenState extends State<KitchenScreen> {
       child: Row(
         children: [
           _iconBtn(Icons.arrow_back_ios_new_rounded,
-              () => Navigator.pop(context)),
+              widget.onExit ?? () => Navigator.pop(context)),
           const SizedBox(width: AppSpacing.sm),
           Container(
             width: 42,

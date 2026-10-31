@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import '../../theme/theme.dart';
 import 'app_button.dart';
@@ -48,7 +50,8 @@ class StatusPill extends StatelessWidget {
   Widget build(BuildContext context) {
     final fg = solid ? Colors.white : color;
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: 5),
+      padding:
+          const EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: 5),
       decoration: BoxDecoration(
         color: solid ? color : AppColors.soft(color, 0.12),
         borderRadius: AppRadius.rPill,
@@ -63,7 +66,8 @@ class StatusPill extends StatelessWidget {
           ],
           Text(
             label,
-            style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w700, color: fg),
+            style: TextStyle(
+                fontSize: 11.5, fontWeight: FontWeight.w700, color: fg),
           ),
         ],
       ),
@@ -234,7 +238,8 @@ class AppPageHeader extends StatelessWidget implements PreferredSizeWidget {
       child: SafeArea(
         bottom: false,
         child: Padding(
-          padding: EdgeInsets.symmetric(horizontal: context.pagePadX, vertical: AppSpacing.sm),
+          padding: EdgeInsets.symmetric(
+              horizontal: context.pagePadX, vertical: AppSpacing.sm),
           child: Row(
             children: [
               if (showBack) ...[
@@ -252,7 +257,8 @@ class AppPageHeader extends StatelessWidget implements PreferredSizeWidget {
                   width: 42,
                   height: 42,
                   decoration: BoxDecoration(
-                    gradient: LinearGradient(colors: AppColors.gradientOf(accent)),
+                    gradient:
+                        LinearGradient(colors: AppColors.gradientOf(accent)),
                     borderRadius: AppRadius.rSm,
                     boxShadow: AppShadows.glow(accent, strength: 0.28),
                   ),
@@ -266,7 +272,9 @@ class AppPageHeader extends StatelessWidget implements PreferredSizeWidget {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     Text(title,
-                        style: AppType.h3, maxLines: 1, overflow: TextOverflow.ellipsis),
+                        style: AppType.h3,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis),
                     if (subtitle != null)
                       Text(subtitle!,
                           style: AppType.caption,
@@ -276,6 +284,92 @@ class AppPageHeader extends StatelessWidget implements PreferredSizeWidget {
                 ),
               ),
               ...actions,
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Dialog peringatan idle — hitung mundur, pop(true) bila "masih di sini",
+/// pop(false) otomatis saat waktu habis (dipakai oleh guard auto-logout).
+class IdleWarningDialog extends StatefulWidget {
+  final int seconds;
+  const IdleWarningDialog({super.key, required this.seconds});
+
+  @override
+  State<IdleWarningDialog> createState() => _IdleWarningDialogState();
+}
+
+class _IdleWarningDialogState extends State<IdleWarningDialog> {
+  late int _remaining = widget.seconds;
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _timer = Timer.periodic(const Duration(seconds: 1), (t) {
+      if (!mounted) return;
+      setState(() => _remaining--);
+      if (_remaining <= 0) {
+        t.cancel();
+        Navigator.pop(context, false); // waktu habis → logout
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Dialog(
+      backgroundColor: AppColors.surface,
+      shape: const RoundedRectangleBorder(borderRadius: AppRadius.rXxl),
+      // Tablet POS itu lebar; tanpa batas ini dialog melar hampir selebar layar.
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 380),
+        child: Padding(
+          padding: const EdgeInsets.all(AppSpacing.xl),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 72,
+                height: 72,
+                child: Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    CircularProgressIndicator(
+                      value: _remaining / widget.seconds,
+                      color: AppColors.warning,
+                      backgroundColor: AppColors.warningSoft,
+                      strokeWidth: 5,
+                    ),
+                    Text('$_remaining',
+                        style: AppType.h2.copyWith(color: AppColors.warning)),
+                  ],
+                ),
+              ),
+              const SizedBox(height: AppSpacing.md),
+              Text('Masih di sana?', style: AppType.h3),
+              const SizedBox(height: AppSpacing.xs),
+              Text(
+                'Sesi akan keluar otomatis karena tidak aktif.',
+                textAlign: TextAlign.center,
+                style: AppType.body.copyWith(color: AppColors.textSecondary),
+              ),
+              const SizedBox(height: AppSpacing.lg),
+              AppButton(
+                label: 'Saya masih di sini',
+                icon: Icons.touch_app_rounded,
+                accent: AppColors.moduleKasir,
+                onPressed: () => Navigator.pop(context, true),
+              ),
             ],
           ),
         ),

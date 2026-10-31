@@ -23,6 +23,7 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 late Database db;
 late File dbFile;
+late Directory testDirectory;
 final _orderRepo = OrderRepository();
 final _cashierRepo = CashierRepository();
 
@@ -54,6 +55,8 @@ void main() {
   setUpAll(() async {
     sqfliteFfiInit();
     databaseFactory = databaseFactoryFfi;
+    testDirectory = await Directory.systemTemp.createTemp('pos-test-');
+    await databaseFactory.setDatabasesPath(testDirectory.path);
     SharedPreferences.setMockInitialValues({'saved_printers': <String>[]});
 
     dbFile = File(p.join(await getDatabasesPath(), 'pos_resto.db'));
@@ -73,8 +76,8 @@ void main() {
   });
 
   tearDownAll(() async {
-    await db.close();
-    if (await dbFile.exists()) await dbFile.delete();
+    await AppDatabase.instance.close();
+    await testDirectory.delete(recursive: true);
   });
 
   test('tanpa shift terbuka, reservasi ber-DP ditolak', () async {
@@ -153,5 +156,94 @@ void main() {
     expect(opened.order.paidAmount, 0);
     expect(opened.order.paymentStatus, 'unpaid');
     expect(await db.query('payments', where: 'order_id = ?', whereArgs: [opened.order.id]), isEmpty);
+  });
+
+  test('tambahan DP hanya mencatat selisih dan pembukaan ulang tetap idempoten', () async {
+    const id = '01JRESVTEST000000000000003';
+    final opened = await ReservationService.instance.openAsOrder(
+        reservation: _reservasi(paid: 50000, id: id),
+        tableNumber: 'TOPUP', cashierName: 'Kasir Uji');
+    final firstPayment = (await db.query('payments',
+        where: 'order_id = ?', whereArgs: [opened.order.id])).single;
+
+    for (var i = 0; i < 3; i++) {
+      final again = await ReservationService.instance.openAsOrder(
+          reservation: _reservasi(paid: 125000, id: id),
+          tableNumber: 'JANGAN-PINDAH', cashierName: 'Kasir Uji');
+      expect(again.order.id, opened.order.id);
+      expect(again.order.tableNumber, 'TOPUP');
+      expect(again.order.paidAmount, 125000);
+      expect(again.order.remaining, 75000);
+    }
+    final payments = await db.query('payments',
+        where: 'order_id = ?', whereArgs: [opened.order.id],
+        orderBy: 'created_at ASC');
+    expect(payments.length, 2);
+    expect(payments.map((p) => p['amount']).toList(), [50000.0, 75000.0]);
+    expect(payments.first['id'], firstPayment['id']);
+    expect(payments.first['created_at'], firstPayment['created_at']);
+
+    await expectLater(ReservationService.instance.openAsOrder(
+        reservation: _reservasi(paid: 50000, id: id),
+        tableNumber: 'STALE', cashierName: 'Kasir Uji'),
+        throwsA(predicate((e) => e.toString().contains('lebih kecil'))));
+    expect((await _orderRepo.getOrderById(opened.order.id))!.paidAmount, 125000);
+  });
+
+  test('dua pembukaan bersamaan tidak membuat order atau kredit DP ganda', () async {
+    const id = '01JRESVTEST000000000000004';
+    final results = await Future.wait([
+      ReservationService.instance.openAsOrder(
+          reservation: _reservasi(paid: 50000, id: id),
+          tableNumber: 'RACE1', cashierName: 'Kasir Uji'),
+      ReservationService.instance.openAsOrder(
+          reservation: _reservasi(paid: 100000, id: id),
+          tableNumber: 'RACE2', cashierName: 'Kasir Uji'),
+      ReservationService.instance.openAsOrder(
+          reservation: _reservasi(paid: 100000, id: id),
+          tableNumber: 'RACE3', cashierName: 'Kasir Uji'),
+    ]);
+    expect(results.map((r) => r.order.id).toSet().length, 1);
+    final saved = await db.query('orders',
+        where: 'reservation_id = ?', whereArgs: [id]);
+    expect(saved.length, 1);
+    expect(saved.single['paid_amount'], 100000.0);
+    final payments = await db.query('payments',
+        where: 'order_id = ?', whereArgs: [results.first.order.id]);
+    expect(payments.length, 2);
+    expect(payments.fold<double>(0, (sum, p) => sum + (p['amount'] as num)), 100000);
+  });
+
+  test('daftar cloud tertinggal tidak bisa membuka ulang reservasi yang lunas', () async {
+    const id = '01JRESVTEST000000000000005';
+    final opened = await ReservationService.instance.openAsOrder(
+        reservation: _reservasi(paid: 100000, id: id),
+        tableNumber: 'PAID', cashierName: 'Kasir Uji');
+    await _orderRepo.processPayment(orderId: opened.order.id,
+        paymentMethod: 'cash', paidAmount: 100000, createdBy: 'Kasir Uji');
+    await expectLater(ReservationService.instance.openAsOrder(
+        reservation: _reservasi(paid: 100000, id: id),
+        tableNumber: 'DUPLIKAT', cashierName: 'Kasir Uji'),
+        throwsA(predicate((e) => e.toString().contains('sudah dilunasi'))));
+    final saved = await db.query('orders',
+        where: 'reservation_id = ?', whereArgs: [id]);
+    expect(saved.length, 1);
+    expect(saved.single['id'], opened.order.id);
+  });
+
+  test('DP tidak ditambah bila riwayat pembayaran lokal belum lengkap', () async {
+    const id = '01JRESVTEST000000000000006';
+    final opened = await ReservationService.instance.openAsOrder(
+        reservation: _reservasi(paid: 50000, id: id),
+        tableNumber: 'RESTORE', cashierName: 'Kasir Uji');
+    // Simulasi restore lama: saldo dibayar pulih, rincian payments belum ada.
+    await db.delete('payments', where: 'order_id = ?', whereArgs: [opened.order.id]);
+    await expectLater(ReservationService.instance.openAsOrder(
+        reservation: _reservasi(paid: 100000, id: id),
+        tableNumber: 'JANGAN-DUPLIKAT', cashierName: 'Kasir Uji'),
+        throwsA(predicate((e) => e.toString().contains('belum lengkap'))));
+    expect((await _orderRepo.getOrderById(opened.order.id))!.paidAmount, 50000);
+    expect(await db.query('payments', where: 'order_id = ?',
+        whereArgs: [opened.order.id]), isEmpty);
   });
 }

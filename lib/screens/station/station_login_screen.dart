@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 
 import '../../services/station_api_client.dart';
@@ -22,22 +24,45 @@ class StationLoginScreen extends StatefulWidget {
   State<StationLoginScreen> createState() => _StationLoginScreenState();
 }
 
-class _StationLoginScreenState extends State<StationLoginScreen> {
+class _StationLoginScreenState extends State<StationLoginScreen>
+    with SingleTickerProviderStateMixin {
   String _pin = '';
   bool _busy = false;
   String? _error;
+  late AnimationController _shakeController;
+
+  /// PIN selalu 4 digit (lihat Manajemen User) — sama seperti login Main POS.
+  static const _pinLength = 4;
 
   // Warna khusus konteks gelap login. SECONDARY gold untuk indikator PIN —
-  // hangat & mewah di atas forest gelap (tombol konfirmasi tetap hijau).
+  // hangat & mewah di atas forest gelap.
   static const _accent = AppColors.accent;
   static const _glassBorder = Color(0x1FFFFFFF);
 
+  @override
+  void initState() {
+    super.initState();
+    _shakeController = AnimationController(
+      duration: const Duration(milliseconds: 400),
+      vsync: this,
+    );
+  }
+
+  @override
+  void dispose() {
+    _shakeController.dispose();
+    super.dispose();
+  }
+
+  /// Sama seperti login Main POS: digit ke-4 langsung mengirim, tak perlu
+  /// tombol konfirmasi.
   void _tap(String d) {
-    if (_busy || _pin.length >= 8) return;
+    if (_busy || _pin.length >= _pinLength) return;
     setState(() {
       _pin += d;
       _error = null;
     });
+    if (_pin.length == _pinLength) _submit();
   }
 
   void _del() {
@@ -55,21 +80,24 @@ class _StationLoginScreenState extends State<StationLoginScreen> {
       final user = await StationApiClient.instance.authPin(_pin);
       if (!mounted) return;
       if (user == null) {
-        setState(() {
-          _error = 'PIN salah';
-          _pin = '';
-          _busy = false;
-        });
+        _failed('PIN salah');
         return;
       }
       widget.onLoggedIn(user);
     } catch (e) {
       if (!mounted) return;
-      setState(() {
-        _error = 'Gagal menghubungi Main POS';
-        _busy = false;
-      });
+      _failed('Gagal menghubungi Main POS');
     }
+  }
+
+  /// Gagal login → pesan + kosongkan PIN + getar (sama seperti Main POS).
+  void _failed(String message) {
+    setState(() {
+      _error = message;
+      _pin = '';
+      _busy = false;
+    });
+    _shakeController.forward(from: 0).then((_) => _shakeController.reverse());
   }
 
   /// Konfirmasi lalu kembali ke halaman pemilihan peran perangkat.
@@ -156,7 +184,8 @@ class _StationLoginScreenState extends State<StationLoginScreen> {
         const SizedBox(height: 4),
         Text(
           'Peran menentukan tampilan',
-          style: TextStyle(fontSize: 14, color: Colors.white.withValues(alpha: 0.6)),
+          style: TextStyle(
+              fontSize: 14, color: Colors.white.withValues(alpha: 0.6)),
         ),
       ],
     );
@@ -187,12 +216,15 @@ class _StationLoginScreenState extends State<StationLoginScreen> {
               const Text(
                 'Masukkan PIN',
                 style: TextStyle(
-                    fontSize: 20, fontWeight: FontWeight.w800, color: Colors.white),
+                    fontSize: 20,
+                    fontWeight: FontWeight.w800,
+                    color: Colors.white),
               ),
               const SizedBox(height: 4),
               Text(
                 'Verifikasi PIN ke Main POS',
-                style: TextStyle(fontSize: 14, color: Colors.white.withValues(alpha: 0.5)),
+                style: TextStyle(
+                    fontSize: 14, color: Colors.white.withValues(alpha: 0.5)),
               ),
               const SizedBox(height: AppSpacing.xl),
               _buildPinDots(),
@@ -220,7 +252,7 @@ class _StationLoginScreenState extends State<StationLoginScreen> {
                 ),
               ),
               const SizedBox(height: AppSpacing.sm),
-              _PinPad(onTap: _tap, onDelete: _del, onSubmit: _submit),
+              _PinPad(onTap: _tap, onDelete: _del),
             ],
           ),
         ),
@@ -229,27 +261,38 @@ class _StationLoginScreenState extends State<StationLoginScreen> {
   }
 
   Widget _buildPinDots() {
-    final count = _pin.isEmpty ? 4 : _pin.length;
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: List.generate(count, (index) {
-        final filled = index < _pin.length;
-        return AnimatedContainer(
-          duration: AppMotion.fast,
-          margin: const EdgeInsets.symmetric(horizontal: AppSpacing.xs),
-          width: filled ? 18 : 15,
-          height: filled ? 18 : 15,
-          decoration: BoxDecoration(
-            color: filled ? _accent : Colors.white.withValues(alpha: 0.12),
-            shape: BoxShape.circle,
-            border:
-                filled ? null : Border.all(color: Colors.white.withValues(alpha: 0.25)),
-            boxShadow: filled
-                ? [BoxShadow(color: _accent.withValues(alpha: 0.6), blurRadius: 12)]
-                : null,
-          ),
-        );
-      }),
+    return AnimatedBuilder(
+      animation: _shakeController,
+      builder: (context, child) {
+        // Getaran horizontal saat PIN salah.
+        final dx = math.sin(_shakeController.value * math.pi * 4) * 10;
+        return Transform.translate(offset: Offset(dx, 0), child: child);
+      },
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: List.generate(_pinLength, (index) {
+          final filled = index < _pin.length;
+          return AnimatedContainer(
+            duration: AppMotion.fast,
+            margin: const EdgeInsets.symmetric(horizontal: AppSpacing.xs),
+            width: filled ? 18 : 15,
+            height: filled ? 18 : 15,
+            decoration: BoxDecoration(
+              color: filled ? _accent : Colors.white.withValues(alpha: 0.12),
+              shape: BoxShape.circle,
+              border: filled
+                  ? null
+                  : Border.all(color: Colors.white.withValues(alpha: 0.25)),
+              boxShadow: filled
+                  ? [
+                      BoxShadow(
+                          color: _accent.withValues(alpha: 0.6), blurRadius: 12)
+                    ]
+                  : null,
+            ),
+          );
+        }),
+      ),
     );
   }
 }
@@ -257,9 +300,7 @@ class _StationLoginScreenState extends State<StationLoginScreen> {
 class _PinPad extends StatelessWidget {
   final void Function(String) onTap;
   final VoidCallback onDelete;
-  final VoidCallback onSubmit;
-  const _PinPad(
-      {required this.onTap, required this.onDelete, required this.onSubmit});
+  const _PinPad({required this.onTap, required this.onDelete});
 
   @override
   Widget build(BuildContext context) {
@@ -290,16 +331,11 @@ class _PinPad extends StatelessWidget {
               ],
             ),
           ),
+        // Tanpa tombol konfirmasi: digit ke-4 langsung mengirim (sama seperti
+        // login Main POS), jadi susunannya pun ikut — [kosong] [0] [hapus].
         Row(
           children: [
-            Expanded(
-              child: _KeyButton(
-                onTap: onDelete,
-                subtle: true,
-                child: Icon(Icons.backspace_rounded,
-                    color: AppColors.soft(Colors.white, 0.6), size: 24),
-              ),
-            ),
+            const Expanded(child: SizedBox()),
             Expanded(
               child: _KeyButton(
                 onTap: () => onTap('0'),
@@ -314,10 +350,10 @@ class _PinPad extends StatelessWidget {
             ),
             Expanded(
               child: _KeyButton(
-                onTap: onSubmit,
-                accent: true,
-                child: const Icon(Icons.check_rounded,
-                    color: AppColors.green, size: 26),
+                onTap: onDelete,
+                subtle: true,
+                child: Icon(Icons.backspace_rounded,
+                    color: AppColors.soft(Colors.white, 0.6), size: 24),
               ),
             ),
           ],
@@ -331,12 +367,10 @@ class _KeyButton extends StatelessWidget {
   final Widget child;
   final VoidCallback onTap;
   final bool subtle;
-  final bool accent;
   const _KeyButton({
     required this.child,
     required this.onTap,
     this.subtle = false,
-    this.accent = false,
   });
 
   @override
@@ -354,14 +388,9 @@ class _KeyButton extends StatelessWidget {
           child: Container(
             height: height,
             decoration: BoxDecoration(
-              // Tombol konfirmasi = putih solid (aksi utama) di atas latar hijau.
-              color: accent
-                  ? AppColors.soft(Colors.white, 0.95)
-                  : Colors.white.withValues(alpha: subtle ? 0.04 : 0.08),
+              color: Colors.white.withValues(alpha: subtle ? 0.04 : 0.08),
               borderRadius: AppRadius.rMd,
-              border: accent
-                  ? null
-                  : Border.all(color: Colors.white.withValues(alpha: 0.12)),
+              border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
             ),
             child: Center(child: child),
           ),
