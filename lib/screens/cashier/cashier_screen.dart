@@ -73,13 +73,18 @@ class _CashierScreenState extends State<CashierScreen>
   @override
   void onDataChanged() => _controller.refreshExternal();
 
+  @override
+  void onCatalogChanged() => _controller.refreshProductPhotos();
+
   void _onSyncingChanged() {
     if (!CloudSyncService.instance.isSyncing) _refreshSync();
   }
 
   Future<void> _refreshSync() async {
     final s = await CloudSyncService.instance.status();
-    if (mounted) _sync.value = s; // hanya pil yang rebuild (ValueListenableBuilder)
+    if (mounted) {
+      _sync.value = s; // hanya pil yang rebuild (ValueListenableBuilder)
+    }
   }
 
   @override

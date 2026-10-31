@@ -6,7 +6,7 @@ import '../../services/app_events.dart';
 import '../../theme/theme.dart';
 import '../../widgets/addon_picker_dialog.dart';
 import '../../utils/currency.dart';
-import '../../widgets/menu_avatar.dart';
+import '../../widgets/product_photo.dart';
 import '../../widgets/pax_input_dialog.dart';
 import '../../widgets/ui/ui.dart';
 
@@ -39,6 +39,9 @@ class _WaiterScreenState extends State<WaiterScreen>
   void onDataChanged() {
     if (_controller.state.viewMode == 'tables') _controller.loadTables();
   }
+
+  @override
+  void onCatalogChanged() => _controller.refreshProductPhotos();
 
   @override
   void deactivate() {
@@ -201,8 +204,7 @@ class _WaiterScreenState extends State<WaiterScreen>
       if (res == null) return; // dibatalkan
       await _controller.selectTableForOrder(table);
       _controller.setPax(res.pax);
-      _controller.setCustomer(
-          name: res.customerName, phone: res.customerPhone);
+      _controller.setCustomer(name: res.customerName, phone: res.customerPhone);
     } else {
       _controller.viewOrderDetail(table);
     }
@@ -433,8 +435,8 @@ class _WaiterScreenState extends State<WaiterScreen>
       child: GridView.builder(
         padding: EdgeInsets.all(context.pagePadX),
         gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: context.responsive(
-              compact: 3, medium: 4, expanded: 5, large: 6),
+          crossAxisCount:
+              context.responsive(compact: 3, medium: 4, expanded: 5, large: 6),
           mainAxisSpacing: AppSpacing.sm,
           crossAxisSpacing: AppSpacing.sm,
           childAspectRatio: 0.95,
@@ -467,8 +469,7 @@ class _WaiterScreenState extends State<WaiterScreen>
 
         // Lebar kolom pesanan disamakan dengan Kasir: proporsional 30% layar,
         // dibatasi 300–440px (sebelumnya tetap 320px → terasa sempit).
-        final cartWidth =
-            (constraints.maxWidth * 0.30).clamp(300.0, 440.0);
+        final cartWidth = (constraints.maxWidth * 0.30).clamp(300.0, 440.0);
         return Row(
           children: [
             Expanded(child: _buildOrderProductPanel(state)),
@@ -599,8 +600,7 @@ class _WaiterScreenState extends State<WaiterScreen>
                         return _WaiterProductTile(
                           product: product,
                           inCart: inCart,
-                          hasAddons:
-                              (state.addonCounts[product.id] ?? 0) > 0,
+                          hasAddons: (state.addonCounts[product.id] ?? 0) > 0,
                           onTap: () => _addProductToCart(product),
                         );
                       },
@@ -636,16 +636,16 @@ class _WaiterScreenState extends State<WaiterScreen>
                     crossAxisAlignment: CrossAxisAlignment.start,
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                    Text(
-                      '${state.cartItemCount} item',
-                      style: AppType.caption
-                          .copyWith(color: AppColors.textTertiary),
-                    ),
-                    Text(
-                      _formatTotal(state.cartTotal),
-                      style:
-                          AppType.amount.copyWith(color: AppColors.moduleWaiter),
-                    ),
+                      Text(
+                        '${state.cartItemCount} item',
+                        style: AppType.caption
+                            .copyWith(color: AppColors.textTertiary),
+                      ),
+                      Text(
+                        _formatTotal(state.cartTotal),
+                        style: AppType.amount
+                            .copyWith(color: AppColors.moduleWaiter),
+                      ),
                     ],
                   ),
                 ),
@@ -770,8 +770,8 @@ class _WaiterScreenState extends State<WaiterScreen>
                       Expanded(
                         child: ListView(
                           controller: scrollController,
-                          padding:
-                              const EdgeInsets.symmetric(vertical: AppSpacing.xs),
+                          padding: const EdgeInsets.symmetric(
+                              vertical: AppSpacing.xs),
                           children: state.cart.entries.map((entry) {
                             final product = state.productCache[entry.key];
                             if (product == null) return const SizedBox.shrink();
@@ -780,8 +780,8 @@ class _WaiterScreenState extends State<WaiterScreen>
                             return _CartItem(
                               name: product.name,
                               qty: entry.value,
-                              price: product.price +
-                                  SelectedAddon.totalOf(addons),
+                              price:
+                                  product.price + SelectedAddon.totalOf(addons),
                               notes: state.cartNotes[entry.key],
                               addonLabel: SelectedAddon.labelOf(addons),
                               onAdd: () => _controller.addToCart(product),
@@ -891,7 +891,8 @@ class _WaiterScreenState extends State<WaiterScreen>
                 end: Alignment.bottomRight,
               ),
               borderRadius: AppRadius.rXl,
-              boxShadow: AppShadows.glow(AppColors.moduleWaiter, strength: 0.32),
+              boxShadow:
+                  AppShadows.glow(AppColors.moduleWaiter, strength: 0.32),
             ),
             padding: const EdgeInsets.all(AppSpacing.lg),
             child: Column(
@@ -936,7 +937,8 @@ class _WaiterScreenState extends State<WaiterScreen>
                   children: [
                     _summaryChip(Icons.table_restaurant_rounded,
                         'Meja ${order.tableNumber}'),
-                    _summaryChip(Icons.people_outline_rounded, '${order.pax} pax'),
+                    _summaryChip(
+                        Icons.people_outline_rounded, '${order.pax} pax'),
                     _summaryChip(
                       Icons.payments_outlined,
                       order.paymentStatus == 'paid' ? 'Lunas' : 'Belum Bayar',
@@ -1217,8 +1219,8 @@ class _WaiterScreenState extends State<WaiterScreen>
           // Selected filter → SECONDARY gold (identitas hangat), unselected netral.
           color: selected ? AppColors.accent : AppColors.surface,
           borderRadius: AppRadius.rPill,
-          border: Border.all(
-              color: selected ? AppColors.accent : AppColors.border),
+          border:
+              Border.all(color: selected ? AppColors.accent : AppColors.border),
         ),
         child: Text(label,
             style: AppType.label.copyWith(
@@ -1257,8 +1259,8 @@ class _WaiterScreenState extends State<WaiterScreen>
 
   Widget _summaryChip(IconData icon, String label) {
     return Container(
-      padding: const EdgeInsets.symmetric(
-          horizontal: AppSpacing.sm, vertical: 4),
+      padding:
+          const EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: 4),
       decoration: BoxDecoration(
         color: AppColors.soft(Colors.white, 0.18),
         borderRadius: AppRadius.rSm,
@@ -1359,12 +1361,13 @@ class _CartPanel extends StatelessWidget {
                     accent: AppColors.moduleWaiter,
                   )
                 : ListView(
-                    padding: const EdgeInsets.symmetric(vertical: AppSpacing.xs),
+                    padding:
+                        const EdgeInsets.symmetric(vertical: AppSpacing.xs),
                     children: state.cart.entries.map((entry) {
                       final product = state.productCache[entry.key];
                       if (product == null) return const SizedBox.shrink();
-                      final addons =
-                          state.cartAddons[entry.key] ?? const <SelectedAddon>[];
+                      final addons = state.cartAddons[entry.key] ??
+                          const <SelectedAddon>[];
                       return _CartItem(
                         name: product.name,
                         qty: entry.value,
@@ -1396,8 +1399,8 @@ class _CartPanel extends StatelessWidget {
                     Text('Total', style: AppType.title),
                     Text(
                       CurrencyHelper.format(state.cartTotal),
-                      style:
-                          AppType.amount.copyWith(color: AppColors.moduleWaiter),
+                      style: AppType.amount
+                          .copyWith(color: AppColors.moduleWaiter),
                     ),
                   ],
                 ),
@@ -1535,8 +1538,7 @@ class _CartItem extends StatelessWidget {
                 width: 44,
                 height: 44,
                 decoration: const BoxDecoration(
-                    color: AppColors.surfaceMuted,
-                    borderRadius: AppRadius.rXs),
+                    color: AppColors.surfaceMuted, borderRadius: AppRadius.rXs),
                 child: const Icon(Icons.remove_rounded,
                     size: 16, color: AppColors.textSecondary),
               ),
@@ -1552,8 +1554,7 @@ class _CartItem extends StatelessWidget {
                 width: 44,
                 height: 44,
                 decoration: const BoxDecoration(
-                    color: AppColors.moduleWaiter,
-                    borderRadius: AppRadius.rXs),
+                    color: AppColors.moduleWaiter, borderRadius: AppRadius.rXs),
                 child: const Icon(Icons.add_rounded,
                     size: 16, color: Colors.white),
               ),
@@ -1655,7 +1656,8 @@ class _WaiterProductTile extends StatelessWidget {
               child: Stack(
                 children: [
                   Positioned.fill(
-                    child: MenuAvatar.fill(name: product.name),
+                    child: ProductPhoto.fill(
+                        name: product.name, photoUrl: product.photoUrl),
                   ),
                   if (selected)
                     Positioned(
@@ -1667,8 +1669,8 @@ class _WaiterProductTile extends StatelessWidget {
                         decoration: BoxDecoration(
                           color: AppColors.moduleWaiter,
                           borderRadius: AppRadius.rXs,
-                          boxShadow:
-                              AppShadows.glow(AppColors.moduleWaiter, strength: 0.4),
+                          boxShadow: AppShadows.glow(AppColors.moduleWaiter,
+                              strength: 0.4),
                         ),
                         child: Text('$inCart',
                             style: const TextStyle(

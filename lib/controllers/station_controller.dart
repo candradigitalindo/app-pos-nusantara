@@ -60,7 +60,9 @@ class StationController extends ChangeNotifier {
     // Real-time: refresh meja saat ada order baru/item ditambah, atau saat
     // order lunas (meja jadi bebas lagi) dari device lain.
     _api.connectWebSocket((event, _) {
-      if (event == 'order_created' ||
+      if (event == 'catalog_updated') {
+        refreshProductPhotos();
+      } else if (event == 'order_created' ||
           event == 'order_items_added' ||
           event == 'order_paid' ||
           event == 'order_updated') {
@@ -91,6 +93,19 @@ class StationController extends ChangeNotifier {
   }
 
   // ── Tables ──────────────────────────────────────────────────────────────────
+
+  Future<void> refreshProductPhotos() async {
+    try {
+      final latest = await _api.getProducts();
+      if (_disposed) return;
+      final urls = {for (final product in latest) product.id: product.photoUrl};
+      products = products.map((p) => p.withPhotoUrl(urls[p.id] ?? '')).toList();
+      for (final id in productCache.keys.toList()) {
+        productCache[id] = productCache[id]!.withPhotoUrl(urls[id] ?? '');
+      }
+      notifyListeners();
+    } catch (_) {}
+  }
 
   Future<void> loadTables() async {
     isLoading = true;

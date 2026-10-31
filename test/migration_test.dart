@@ -1,4 +1,4 @@
-// Verifikasi migrasi DB v10 → v14 terhadap SQLITE ASLI berisi data.
+// Verifikasi migrasi DB v10 → v15 terhadap SQLITE ASLI berisi data.
 //
 // Migrasi-migrasi ini menyentuh tabel yang sudah dipakai di lapangan:
 //
@@ -48,12 +48,21 @@ void main() {
     await testDirectory.delete(recursive: true);
   });
 
-  test('versi skema naik ke 14', () async {
+  test('versi skema naik ke 15', () async {
     final versi = (await db.rawQuery('PRAGMA user_version')).first.values.first;
-    expect(versi, 14);
+    expect(versi, 15);
   });
 
-  test('migrasi v14 mempertahankan item lama tanpa menebak identitas produk', () async {
+  test('migrasi v15 mempertahankan produk lama dengan foto kosong', () async {
+    final product = (await db.query('products')).single;
+    expect(product['id'], 'PRD1');
+    expect(product['name'], 'Nasi Goreng');
+    expect(product['price'], 25000);
+    expect(product['photo_url'], '');
+  });
+
+  test('migrasi v14 mempertahankan item lama tanpa menebak identitas produk',
+      () async {
     final rows = await db.query('order_items');
     expect(rows.single['id'], 'ITEMLAMA');
     expect(rows.single['product_name'], 'Nasi Goreng');
@@ -67,7 +76,8 @@ void main() {
       expect(info.map((c) => c['name']), contains('reservation_id'));
     });
 
-    test('pembayaran lama selamat utuh setelah payments dibuat ulang', () async {
+    test('pembayaran lama selamat utuh setelah payments dibuat ulang',
+        () async {
       final rows = await db.query('payments', orderBy: 'created_at');
       expect(rows.length, 2);
       expect(rows.first['payment_method'], 'cash');
@@ -76,7 +86,8 @@ void main() {
       expect(rows.last['payment_note'], 'Pesan online — dibayar QRIS');
     });
 
-    test("metode 'reservasi_dp' diterima, metode asing tetap ditolak", () async {
+    test("metode 'reservasi_dp' diterima, metode asing tetap ditolak",
+        () async {
       await db.insert('payments', {
         'id': '01JQTESTPAYMENT0000000RES1',
         'order_id': 'ORDERLAMA',
@@ -143,7 +154,8 @@ void main() {
         for (final c in info) c['name'] as String: c['type'] as String
       };
       expect(kolom['id'], 'TEXT', reason: 'ULID, bukan INTEGER lagi');
-      expect(kolom.keys, containsAll(['group_name', 'sort_order', 'is_deleted']));
+      expect(
+          kolom.keys, containsAll(['group_name', 'sort_order', 'is_deleted']));
     });
 
     test('indeks pencarian dibuat', () async {
@@ -223,8 +235,10 @@ Future<void> _bangunDatabaseV10(String path) async {
     )
   ''');
   await old.insert('order_items', {
-    'id': 'ITEMLAMA', 'order_id': 'ORDERLAMA',
-    'product_name': 'Nasi Goreng', 'qty': 2,
+    'id': 'ITEMLAMA',
+    'order_id': 'ORDERLAMA',
+    'product_name': 'Nasi Goreng',
+    'qty': 2,
   });
 
   // Bentuk LAMA product_addons: id INTEGER AUTOINCREMENT.
@@ -321,31 +335,45 @@ Future<void> _bangunDatabaseV10(String path) async {
     'created_at': '2026-08-01T10:05:00.000',
   });
 
-  await old.insert('products',
-      {'id': 'PRD1', 'name': 'Nasi Goreng', 'price': 25000});
+  await old.insert(
+      'products', {'id': 'PRD1', 'name': 'Nasi Goreng', 'price': 25000});
 
   // Outlet yang sudah berjalan: pajak + service charge + biaya tetap nonaktif.
   await old.insert('additional_charges', {
-    'name': 'Pajak Restoran (PB1)', 'charge_type': 'percentage',
-    'value': 10.0, 'is_active': 1,
+    'name': 'Pajak Restoran (PB1)',
+    'charge_type': 'percentage',
+    'value': 10.0,
+    'is_active': 1,
   });
   await old.insert('additional_charges', {
-    'name': 'Service Charge', 'charge_type': 'percentage',
-    'value': 5.0, 'is_active': 1,
+    'name': 'Service Charge',
+    'charge_type': 'percentage',
+    'value': 5.0,
+    'is_active': 1,
   });
   await old.insert('additional_charges', {
-    'name': 'Biaya Kemasan', 'charge_type': 'fixed',
-    'value': 2000.0, 'is_active': 0,
+    'name': 'Biaya Kemasan',
+    'charge_type': 'fixed',
+    'value': 2000.0,
+    'is_active': 0,
   });
 
   // Pesanan historis yang merujuk biaya di atas lewat charge_id INTEGER.
   await old.insert('order_additional_charges', {
-    'order_id': 'ORDERLAMA', 'charge_id': 1, 'name': 'Pajak Restoran (PB1)',
-    'charge_type': 'percentage', 'value': 10.0, 'applied_amount': 2500.0,
+    'order_id': 'ORDERLAMA',
+    'charge_id': 1,
+    'name': 'Pajak Restoran (PB1)',
+    'charge_type': 'percentage',
+    'value': 10.0,
+    'applied_amount': 2500.0,
   });
   await old.insert('order_additional_charges', {
-    'order_id': 'ORDERLAMA', 'charge_id': 2, 'name': 'Service Charge',
-    'charge_type': 'percentage', 'value': 5.0, 'applied_amount': 1250.0,
+    'order_id': 'ORDERLAMA',
+    'charge_id': 2,
+    'name': 'Service Charge',
+    'charge_type': 'percentage',
+    'value': 5.0,
+    'applied_amount': 1250.0,
   });
 
   await old.close();

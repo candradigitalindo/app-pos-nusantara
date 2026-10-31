@@ -13,6 +13,7 @@ import '../../services/station_api_client.dart';
 import '../../theme/theme.dart';
 import '../../utils/currency.dart';
 import '../../widgets/ui/ui.dart';
+import '../../widgets/product_photo.dart';
 import '../settings/printer_settings_screen.dart';
 
 /// Layar utama mode Station: pilih meja → menu → kirim order ke Main POS.
@@ -196,7 +197,8 @@ class _StationScreenState extends State<StationScreen> {
         tooltip: 'Muat ulang',
       ),
       PopupMenuButton<String>(
-        icon: const Icon(Icons.more_vert_rounded, color: AppColors.textSecondary),
+        icon:
+            const Icon(Icons.more_vert_rounded, color: AppColors.textSecondary),
         onSelected: (v) {
           if (v == 'printer') _openPrinterSettings();
           if (v == 'server') _changeServer();
@@ -210,7 +212,8 @@ class _StationScreenState extends State<StationScreen> {
             const PopupMenuItem(
                 value: 'logout', child: Text('Logout (ganti user)')),
           const PopupMenuItem(value: 'server', child: Text('Ganti Main POS')),
-          const PopupMenuItem(value: 'exit', child: Text('Keluar Mode Station')),
+          const PopupMenuItem(
+              value: 'exit', child: Text('Keluar Mode Station')),
         ],
       ),
     ];
@@ -267,10 +270,14 @@ class _StationScreenState extends State<StationScreen> {
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
                 IconBadge(
-                    icon: Icons.table_restaurant_rounded, color: color, size: 44),
+                    icon: Icons.table_restaurant_rounded,
+                    color: color,
+                    size: 44),
                 const SizedBox(height: AppSpacing.xs),
                 Text('${t['table_number']}',
-                    style: AppType.h3, maxLines: 1, overflow: TextOverflow.ellipsis),
+                    style: AppType.h3,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis),
                 const SizedBox(height: AppSpacing.xxs),
                 StatusPill(
                   label: available ? 'Tersedia' : 'Terisi',
@@ -282,8 +289,10 @@ class _StationScreenState extends State<StationScreen> {
                 if (order is Map && order['total_amount'] != null) ...[
                   const SizedBox(height: AppSpacing.xxs),
                   Text(
-                    CurrencyHelper.format((order['total_amount'] as num).toDouble()),
-                    style: AppType.caption.copyWith(color: AppColors.textTertiary),
+                    CurrencyHelper.format(
+                        (order['total_amount'] as num).toDouble()),
+                    style:
+                        AppType.caption.copyWith(color: AppColors.textTertiary),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                   ),
@@ -320,8 +329,7 @@ class _StationScreenState extends State<StationScreen> {
           );
         }
         // Lebar kolom pesanan disamakan dengan Kasir (proporsional 30%, 300–440).
-        final cartWidth =
-            (constraints.maxWidth * 0.30).clamp(300.0, 440.0);
+        final cartWidth = (constraints.maxWidth * 0.30).clamp(300.0, 440.0);
         return Row(
           children: [
             Expanded(child: menu),
@@ -468,16 +476,16 @@ class _StationScreenState extends State<StationScreen> {
                       AppType.label.copyWith(color: AppColors.textSecondary)),
               const Spacer(),
               Text('${items.length} item',
-                  style: AppType.caption
-                      .copyWith(color: AppColors.textTertiary)),
+                  style:
+                      AppType.caption.copyWith(color: AppColors.textTertiary)),
             ],
           ),
           if (items.isEmpty)
             Padding(
               padding: const EdgeInsets.only(top: AppSpacing.xs),
               child: Text('Belum ada item terkirim.',
-                  style: AppType.caption
-                      .copyWith(color: AppColors.textTertiary)),
+                  style:
+                      AppType.caption.copyWith(color: AppColors.textTertiary)),
             )
           else
             ...items.map((it) {
@@ -629,34 +637,42 @@ class _StationScreenState extends State<StationScreen> {
           accent: active ? _accent : null,
           color: active ? AppColors.soft(_accent, 0.08) : null,
           padding: const EdgeInsets.all(AppSpacing.sm),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisAlignment: MainAxisAlignment.center,
+          child: Row(
             children: [
-              // Flexible + jarak kecil: nama 2 baris (mis. "Nasi Goreng
-              // Spesial") tak lagi melewati tinggi kartu.
-              Flexible(
-                child: Text(p.name,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: AppType.title),
-              ),
-              const SizedBox(height: AppSpacing.xxs),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              ProductPhoto(name: p.name, photoUrl: p.photoUrl, size: 52),
+              const SizedBox(width: AppSpacing.xs),
+              Expanded(
+                  child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  Expanded(
-                    child: Text(
-                      CurrencyHelper.format(p.price),
-                      style: AppType.label.copyWith(color: _accent),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
+                  // Flexible + jarak kecil: nama 2 baris (mis. "Nasi Goreng
+                  // Spesial") tak lagi melewati tinggi kartu.
+                  Flexible(
+                    child: Text(p.name,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: AppType.title),
                   ),
-                  if (active)
-                    StatusPill(label: '$inCart', color: _accent, solid: true),
+                  const SizedBox(height: AppSpacing.xxs),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Expanded(
+                        child: Text(
+                          CurrencyHelper.format(p.price),
+                          style: AppType.label.copyWith(color: _accent),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      if (active)
+                        StatusPill(
+                            label: '$inCart', color: _accent, solid: true),
+                    ],
+                  ),
                 ],
-              ),
+              )),
             ],
           ),
         );
@@ -983,8 +999,8 @@ class _StationScreenState extends State<StationScreen> {
                                   overflow: TextOverflow.ellipsis),
                               if (notes?.isNotEmpty == true)
                                 Text(notes!,
-                                    style: AppType.caption
-                                        .copyWith(color: AppColors.textTertiary),
+                                    style: AppType.caption.copyWith(
+                                        color: AppColors.textTertiary),
                                     maxLines: 2,
                                     overflow: TextOverflow.ellipsis),
                             ],
@@ -992,7 +1008,8 @@ class _StationScreenState extends State<StationScreen> {
                         ),
                         if (status.isNotEmpty) ...[
                           const SizedBox(width: AppSpacing.xs),
-                          StatusPill(label: status, color: _statusColor(status)),
+                          StatusPill(
+                              label: status, color: _statusColor(status)),
                         ],
                         IconButton(
                           icon: const Icon(Icons.more_vert, size: 20),
@@ -1216,12 +1233,14 @@ class _StationScreenState extends State<StationScreen> {
     if (choice == 'void') {
       final by = await _managerAuth();
       if (by == null || !mounted) return;
-      final ok = await _controller.voidDetailItem(itemId: itemId, qty: n, by: by);
+      final ok =
+          await _controller.voidDetailItem(itemId: itemId, qty: n, by: by);
       _snackResult(ok, 'Item di-void');
     } else if (choice == 'titip') {
       final by = await _managerAuth();
       if (by == null || !mounted) return;
-      final ok = await _controller.parkDetailItem(itemId: itemId, qty: n, by: by);
+      final ok =
+          await _controller.parkDetailItem(itemId: itemId, qty: n, by: by);
       _snackResult(ok, 'Item dititip ke Meja Titipan');
     } else if (choice == 'move') {
       final target = await _moveTargetPicker();
@@ -1273,9 +1292,8 @@ class _StationScreenState extends State<StationScreen> {
 
   /// Pindahkan SELURUH order aktif ke meja kosong lain.
   Future<void> _moveOrderTable() async {
-    final empty = _controller.tables
-        .where((t) => t['active_order'] == null)
-        .toList();
+    final empty =
+        _controller.tables.where((t) => t['active_order'] == null).toList();
     if (empty.isEmpty) {
       showAppSnack(context, 'Tidak ada meja kosong', isError: true);
       return;
@@ -1291,8 +1309,7 @@ class _StationScreenState extends State<StationScreen> {
             .map((t) => ListTile(
                   leading: const Icon(Icons.table_restaurant_rounded),
                   title: Text('Meja ${t['table_number']}'),
-                  onTap: () =>
-                      Navigator.pop(ctx, t['table_number'] as String),
+                  onTap: () => Navigator.pop(ctx, t['table_number'] as String),
                 ))
             .toList(),
       ),

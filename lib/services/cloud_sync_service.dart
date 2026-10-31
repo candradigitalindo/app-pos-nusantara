@@ -14,6 +14,8 @@ import 'cloud_restore_writer.dart';
 import 'online_order_service.dart';
 import 'sync_acknowledgements.dart';
 import 'outlet_service.dart';
+import 'product_photo_cache.dart';
+import 'app_events.dart';
 
 /// Mengirim outbox (sync_queue) ke cloud-pos via endpoint BatchSync.
 /// Meniru pola sync_worker.go di backend Go: push berkala + exponential
@@ -31,7 +33,8 @@ class CloudSyncService {
     receiveTimeout: const Duration(seconds: 30),
   ));
 
-  static const _lastSyncKey = 'cloud_last_pull_at';
+  // New photo-capable clients must replay old products once after upgrading.
+  static const _lastSyncKey = 'cloud_last_pull_at:photos-v1';
   Future<void>? _masterPull;
   static const _lastSyncAtKey = 'cloud_last_sync_at';
 
@@ -424,12 +427,18 @@ class CloudSyncService {
             await _applyCategory(txn, row);
           }
           for (final row in products) {
-            await _applyProduct(txn, row);
+            await _applyProduct(txn, row, baseUrl);
           }
           for (final row in deleted) {
             await _applyDeletion(txn, row);
           }
         });
+        if (categories.isNotEmpty ||
+            products.isNotEmpty ||
+            deleted.isNotEmpty) {
+          notifyDataChanged('catalog_updated');
+        }
+        _prefetchProductPhotos(db);
         // Saving only after commit makes a crash replay safe. Never substitute
         // a tablet timestamp for the server's cursor.
         await prefs.setString(key, checkpoint);
@@ -526,7 +535,7 @@ class CloudSyncService {
               await _applyCategory(txn, row);
             }
             for (final row in products) {
-              await _applyProduct(txn, row);
+              await _applyProduct(txn, row, baseUrl);
             }
             // Retain the empty-outlet guard: an accidental empty configuration
             // must not erase the entire local menu.
@@ -537,6 +546,13 @@ class CloudSyncService {
                   await _softDeleteNotInCloud(txn, 'products', productIds);
             }
           });
+          if (categories.isNotEmpty ||
+              products.isNotEmpty ||
+              deletedCategories > 0 ||
+              deletedProducts > 0) {
+            notifyDataChanged('catalog_updated');
+          }
+          _prefetchProductPhotos(db);
           // A full pull spans requests, not one server snapshot. Replaying updates
           // from the beginning catches edits committed while pages were fetched,
           // even when the tablet clock is ahead of the server.
@@ -670,7 +686,11 @@ class CloudSyncService {
       if (id == null || cloudIds.contains(id)) continue;
       await db.update(
         table,
-        {'is_deleted': 1, 'updated_at': now},
+        {
+          'is_deleted': 1,
+          'updated_at': now,
+          if (table == 'products') 'photo_url': ''
+        },
         where: 'id = ?',
         whereArgs: [id],
       );
@@ -698,7 +718,24 @@ class CloudSyncService {
     );
   }
 
-  Future<void> _applyProduct(dynamic db, Map prod) async {
+  void _prefetchProductPhotos(dynamic db) {
+    final cache = ProductPhotoCache.instance;
+    unawaited(() async {
+      try {
+        // Include old URLs so a later successful cycle retries previously
+        // offline photos even when no product changed in that cycle.
+        final rows = await db.query('products',
+            columns: ['photo_url'],
+            where: "is_deleted = 0 AND photo_url != ''");
+        await cache
+            .prefetch(rows.map<String>((row) => row['photo_url'] as String));
+      } catch (_) {
+        // Disk/network/plugin errors only leave the image placeholder visible.
+      }
+    }());
+  }
+
+  Future<void> _applyProduct(dynamic db, Map prod, String cloudBase) async {
     final id = _masterIdentity(prod);
     final name = prod['name'] as String?;
     if (name == null) return;
@@ -706,6 +743,8 @@ class CloudSyncService {
     final stock = (prod['stock'] as num?)?.toInt() ?? 0;
     final code = prod['code'] as String?;
     final desc = prod['description'] as String?;
+    final hasPhoto = prod.containsKey('photo_url');
+    final photoUrl = ProductPhotoCache.resolveUrl(prod['photo_url'], cloudBase);
     var categoryId = prod['category_id'] as String?;
     if (categoryId != null && categoryId.isEmpty) categoryId = null;
     final categoryName = prod['category_name'] as String?;
@@ -745,14 +784,27 @@ class CloudSyncService {
 
     Future<void> upsert(String? catId) => db.rawInsert(
           '''
-          INSERT INTO products (id, name, code, description, price, stock, category_id, is_deleted, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+          INSERT INTO products (id, name, code, description, price, stock, category_id, is_deleted, created_at, updated_at, photo_url)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
           ON CONFLICT(id) DO UPDATE SET
             name=excluded.name, code=excluded.code, description=excluded.description,
             price=excluded.price, stock=excluded.stock, category_id=excluded.category_id,
-            is_deleted=0, updated_at=excluded.updated_at
+            is_deleted=0, updated_at=excluded.updated_at,
+            photo_url=CASE WHEN ? = 1 THEN excluded.photo_url ELSE products.photo_url END
           ''',
-          [id, name, code, desc, price, stock, catId, now, now],
+          [
+            id,
+            name,
+            code,
+            desc,
+            price,
+            stock,
+            catId,
+            now,
+            now,
+            photoUrl,
+            hasPhoto ? 1 : 0
+          ],
         );
 
     try {
@@ -768,7 +820,11 @@ class CloudSyncService {
     final table = type == 'category' ? 'categories' : 'products';
     await db.update(
       table,
-      {'is_deleted': 1, 'updated_at': DateTime.now().toIso8601String()},
+      {
+        'is_deleted': 1,
+        'updated_at': DateTime.now().toIso8601String(),
+        if (table == 'products') 'photo_url': ''
+      },
       where: 'id = ?',
       whereArgs: [id],
     );

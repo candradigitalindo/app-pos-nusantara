@@ -1,13 +1,16 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../models/models.dart';
+import 'product_photo_cache.dart';
 
 /// Hasil penemuan Main POS di jaringan lokal.
 class StationServer {
@@ -43,6 +46,10 @@ class StationApiClient {
   String? _baseUrl;
   String? _outletCode; // identitas Main POS untuk auto-rediscovery
   bool _rediscovering = false;
+  final _photoQueue =
+      <String, ({String url, String path, String base, String token})>{};
+  final _photoScheduled = <String>{};
+  Future<void>? _photoWarm;
 
   /// Dipanggil saat Main POS menolak sesi (401) — mis. Main POS restart →
   /// token hangus. StationGate memakainya untuk otomatis kembali ke LOGIN
@@ -179,9 +186,8 @@ class StationApiClient {
   /// Cek satu alamat apakah Main POS (hit /api/ping).
   Future<StationServer?> ping(String baseUrl) async {
     try {
-      final url = baseUrl.endsWith('/')
-          ? '${baseUrl}api/ping'
-          : '$baseUrl/api/ping';
+      final url =
+          baseUrl.endsWith('/') ? '${baseUrl}api/ping' : '$baseUrl/api/ping';
       final resp = await _dio.get(url,
           options: Options(receiveTimeout: const Duration(seconds: 3)));
       final data = resp.data is Map ? resp.data['data'] : null;
@@ -204,7 +210,9 @@ class StationApiClient {
     void Function(int current, int total)? onProgress,
   }) async {
     final localIp = await _localIp();
-    if (localIp == null) throw Exception('Tidak dapat mendeteksi IP. WiFi aktif?');
+    if (localIp == null) {
+      throw Exception('Tidak dapat mendeteksi IP. WiFi aktif?');
+    }
 
     final parts = localIp.split('.');
     final subnet = '${parts[0]}.${parts[1]}.${parts[2]}';
@@ -304,7 +312,96 @@ class StationApiClient {
         ? '/api/products?category_id=$categoryId'
         : '/api/products';
     final list = await _getList(path);
-    return list.map((m) => Product.fromMap(m as Map<String, dynamic>)).toList();
+    final products =
+        list.map((m) => Product.fromMap(m as Map<String, dynamic>)).toList();
+    _queueProductPhotos(list, products);
+    return products;
+  }
+
+  void _queueProductPhotos(List<dynamic> rows, List<Product> products) {
+    final base = _baseUrl;
+    final token = _dio.options.headers['X-Station-Token']?.toString();
+    if (base == null || token == null) return;
+    for (var index = 0; index < products.length; index++) {
+      final product = products[index];
+      final rawPath = (rows[index] as Map)['photo_cache_path'];
+      if (product.photoUrl.isEmpty || rawPath is! String) continue;
+      final route = Uri.tryParse(rawPath);
+      final expectedPath =
+          '/api/products/${Uri.encodeComponent(product.id)}/photo';
+      final version = sha256.convert(utf8.encode(product.photoUrl)).toString();
+      // Only the advertised product route on this Main POS may receive its
+      // session token. Never send credentials to arbitrary URLs or redirects.
+      if (route == null ||
+          route.hasScheme ||
+          route.hasAuthority ||
+          route.path != expectedPath ||
+          route.fragment.isNotEmpty ||
+          route.queryParameters['v'] != version) {
+        continue;
+      }
+      final key = '$base\u0000${product.photoUrl}';
+      if (_photoScheduled.add(key)) {
+        _photoQueue[key] =
+            (url: product.photoUrl, path: rawPath, base: base, token: token);
+      }
+    }
+    _startPhotoWarm();
+  }
+
+  void _startPhotoWarm() {
+    if (_photoWarm != null || _photoQueue.isEmpty) return;
+    final work = _warmProductPhotos();
+    _photoWarm = work;
+    unawaited(work.whenComplete(() {
+      _photoWarm = null;
+      _startPhotoWarm();
+    }));
+  }
+
+  Future<void> _warmProductPhotos() async {
+    var unavailable = false;
+    Future<void> warm() async {
+      while (_photoQueue.isNotEmpty && !unavailable) {
+        final key = _photoQueue.keys.first;
+        final job = _photoQueue.remove(key)!;
+        final cancel = CancelToken();
+        try {
+          if (_baseUrl != job.base ||
+              _dio.options.headers['X-Station-Token'] != job.token ||
+              await ProductPhotoCache.instance.cachedFile(job.url) != null) {
+            continue;
+          }
+          final response = await _dio.get<List<int>>('${job.base}${job.path}',
+              options: Options(
+                  responseType: ResponseType.bytes,
+                  headers: {'X-Station-Token': job.token},
+                  followRedirects: false,
+                  receiveTimeout: const Duration(seconds: 4)),
+              cancelToken: cancel, onReceiveProgress: (received, total) {
+            if (received > 10 * 1024 * 1024 || total > 10 * 1024 * 1024) {
+              cancel.cancel('Foto terlalu besar');
+            }
+          });
+          if (response.data != null) {
+            await ProductPhotoCache.instance
+                .storeBytes(job.url, Uint8List.fromList(response.data!));
+          }
+        } catch (_) {
+          // Photos must not prevent using the menu. Stop this prefetch on
+          // network/session failure; tiles can use an existing/cloud cache.
+          unavailable = true;
+        } finally {
+          _photoScheduled.remove(key);
+        }
+      }
+    }
+
+    await Future.wait(List.generate(3, (_) => warm()));
+    if (unavailable) {
+      _photoScheduled.removeAll(_photoQueue.keys);
+      _photoQueue.clear();
+    }
   }
 
   /// Order aktif + itemnya (field 'items' pada tiap order).
@@ -396,8 +493,7 @@ class StationApiClient {
   }
 
   /// Titipkan item ke Meja Titipan (per-unit).
-  Future<void> parkItem(String itemId,
-      {int? qty, required String by}) async {
+  Future<void> parkItem(String itemId, {int? qty, required String by}) async {
     return _withRetry(idempotent: false, () async {
       await _dio.post('$_base/api/order-items/$itemId/park', data: {
         if (qty != null) 'qty': qty,

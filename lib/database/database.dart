@@ -32,7 +32,7 @@ class AppDatabase {
 
     return openDatabase(
       path,
-      version: 14,
+      version: 15,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
       onConfigure: _onConfigure,
@@ -50,7 +50,8 @@ class AppDatabase {
       // Catat siapa yang memberi kompliment & alasannya
       await db.execute('ALTER TABLE orders ADD COLUMN compliment_by TEXT');
       await db.execute('ALTER TABLE orders ADD COLUMN compliment_reason TEXT');
-      await db.execute('ALTER TABLE orders ADD COLUMN complimented_at DATETIME');
+      await db
+          .execute('ALTER TABLE orders ADD COLUMN complimented_at DATETIME');
     }
     if (oldVersion < 4) {
       // Catatan/label diskon bill (mis. "member"), dikirim ke cloud
@@ -131,7 +132,8 @@ class AppDatabase {
       // Cloud butuh daftar biaya ini untuk menghitung total pesanan online
       // dengan cara yang sama persis dengan kasir; tanpa itu nominal QRIS
       // yang dibayar tamu bisa berbeda dari tagihan yang dihitung POS.
-      await db.execute('ALTER TABLE additional_charges ADD COLUMN sync_id TEXT');
+      await db
+          .execute('ALTER TABLE additional_charges ADD COLUMN sync_id TEXT');
       final rows = await db.query('additional_charges', columns: ['id']);
       for (final r in rows) {
         await db.update(
@@ -177,6 +179,10 @@ class AppDatabase {
       // Simpan identitas menu saat pesanan dibuat. Baris lama tetap NULL:
       // nama dapat berubah atau dipakai beberapa produk, jadi jangan ditebak.
       await db.execute('ALTER TABLE order_items ADD COLUMN product_id TEXT');
+    }
+    if (oldVersion < 15) {
+      await db.execute(
+          "ALTER TABLE products ADD COLUMN photo_url TEXT NOT NULL DEFAULT ''");
     }
   }
 
@@ -317,6 +323,7 @@ class AppDatabase {
       CREATE TABLE IF NOT EXISTS products (
         id TEXT PRIMARY KEY CHECK (length(id) = 26),
         name TEXT NOT NULL,
+        photo_url TEXT NOT NULL DEFAULT '',
         code TEXT UNIQUE,
         description TEXT,
         price REAL NOT NULL,

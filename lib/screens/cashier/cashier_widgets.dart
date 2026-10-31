@@ -3,7 +3,7 @@ import 'package:flutter/material.dart';
 import '../../models/models.dart';
 import '../../theme/theme.dart';
 import '../../utils/currency.dart';
-import '../../widgets/menu_avatar.dart';
+import '../../widgets/product_photo.dart';
 import '../../widgets/ui/ui.dart';
 
 /// Komponen tampilan Kasir yang dipakai BERSAMA oleh kasir perangkat utama
@@ -213,7 +213,9 @@ class CashierProductTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final active = inCart > 0;
     return Material(
-      color: active ? AppColors.soft(AppColors.moduleKasir, 0.10) : AppColors.surface,
+      color: active
+          ? AppColors.soft(AppColors.moduleKasir, 0.10)
+          : AppColors.surface,
       borderRadius: AppRadius.rLg,
       child: InkWell(
         borderRadius: AppRadius.rLg,
@@ -241,7 +243,8 @@ class CashierProductTile extends StatelessWidget {
                     child: Stack(
                       children: [
                         Positioned.fill(
-                          child: MenuAvatar.fill(name: product.name),
+                          child: ProductPhoto.fill(
+                              name: product.name, photoUrl: product.photoUrl),
                         ),
                         if (active)
                           Positioned(
@@ -253,7 +256,8 @@ class CashierProductTile extends StatelessWidget {
                               decoration: BoxDecoration(
                                 color: AppColors.moduleKasir,
                                 borderRadius: AppRadius.rSm,
-                                boxShadow: AppShadows.glow(AppColors.moduleKasir),
+                                boxShadow:
+                                    AppShadows.glow(AppColors.moduleKasir),
                               ),
                               child: Text(
                                 '$inCart',
@@ -577,7 +581,8 @@ class _CashierPaymentSheetState extends State<CashierPaymentSheet> {
                     const SizedBox(height: 2),
                     Text(
                       'Total: ${CurrencyHelper.format(widget.total)}',
-                      style: AppType.title.copyWith(color: AppColors.moduleKasir),
+                      style:
+                          AppType.title.copyWith(color: AppColors.moduleKasir),
                     ),
                   ],
                 ),
@@ -615,15 +620,15 @@ class _CashierPaymentSheetState extends State<CashierPaymentSheet> {
               inputFormatters: [RupiahInputFormatter()],
               decoration: InputDecoration(
                 prefixText: 'Rp ',
-                border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(12)),
+                border:
+                    OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
                 focusedBorder: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(12),
                   borderSide:
                       const BorderSide(color: AppColors.moduleKasir, width: 2),
                 ),
-                contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 16, vertical: 14),
+                contentPadding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
               ),
               onChanged: (_) => setState(() {}),
             ),
@@ -635,9 +640,7 @@ class _CashierPaymentSheetState extends State<CashierPaymentSheet> {
               style: TextStyle(
                 fontWeight: FontWeight.bold,
                 fontSize: 14,
-                color: change >= 0
-                    ? AppColors.moduleKasir
-                    : AppColors.danger,
+                color: change >= 0 ? AppColors.moduleKasir : AppColors.danger,
               ),
             ),
             const SizedBox(height: 16),
@@ -701,7 +704,8 @@ class CashierTablePickerDialog extends StatefulWidget {
       {super.key, required this.tables, this.selectedNumber});
 
   @override
-  State<CashierTablePickerDialog> createState() => _CashierTablePickerDialogState();
+  State<CashierTablePickerDialog> createState() =>
+      _CashierTablePickerDialogState();
 }
 
 class _CashierTablePickerDialogState extends State<CashierTablePickerDialog> {
@@ -736,8 +740,8 @@ class _CashierTablePickerDialogState extends State<CashierTablePickerDialog> {
                       color: AppColors.moduleKasir, size: 26),
                   const SizedBox(width: 10),
                   const Text('Pilih Meja',
-                      style: TextStyle(
-                          fontSize: 22, fontWeight: FontWeight.w800)),
+                      style:
+                          TextStyle(fontSize: 22, fontWeight: FontWeight.w800)),
                   const Spacer(),
                   IconButton(
                     onPressed: () => Navigator.pop(context),
@@ -768,8 +772,7 @@ class _CashierTablePickerDialogState extends State<CashierTablePickerDialog> {
                         padding: EdgeInsets.zero,
                         // Kolom mengisi lebar; di HP lebih sedikit agar tak
                         // sempit, sisanya scroll ke bawah.
-                        gridDelegate:
-                            SliverGridDelegateWithFixedCrossAxisCount(
+                        gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
                           crossAxisCount: context.isPhone ? 3 : 5,
                           mainAxisSpacing: 12,
                           crossAxisSpacing: 12,

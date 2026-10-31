@@ -47,12 +47,24 @@ void notifyDataChanged(String event) =>
 mixin AppEventsRefresh<T extends StatefulWidget> on State<T> {
   StreamSubscription<String>? _appEventsSub;
   Timer? _appEventsDebounce;
+  Timer? _catalogDebounce;
 
   /// Muat ulang data layar ini.
   void onDataChanged();
 
+  /// Photo refresh is separate from operational order/table refresh so a
+  /// catalog event never resets an in-progress cart or changes its prices.
+  void onCatalogChanged() {}
+
   void listenDataChanges() {
-    _appEventsSub = AppEvents.instance.stream.listen((_) {
+    _appEventsSub = AppEvents.instance.stream.listen((event) {
+      if (event == 'catalog_updated') {
+        _catalogDebounce?.cancel();
+        _catalogDebounce = Timer(const Duration(milliseconds: 350), () {
+          if (mounted) onCatalogChanged();
+        });
+        return;
+      }
       _appEventsDebounce?.cancel();
       _appEventsDebounce = Timer(const Duration(milliseconds: 350), () {
         if (mounted) onDataChanged();
@@ -65,5 +77,7 @@ mixin AppEventsRefresh<T extends StatefulWidget> on State<T> {
     _appEventsSub = null;
     _appEventsDebounce?.cancel();
     _appEventsDebounce = null;
+    _catalogDebounce?.cancel();
+    _catalogDebounce = null;
   }
 }

@@ -2,10 +2,11 @@ import 'package:flutter/material.dart';
 
 import '../../controllers/products_controller.dart';
 import '../../models/models.dart';
+import '../../services/app_events.dart';
 import '../../theme/theme.dart';
 import 'product_addons_screen.dart';
 import '../../utils/currency.dart';
-import '../../widgets/menu_avatar.dart';
+import '../../widgets/product_photo.dart';
 import '../../widgets/ui/ui.dart';
 
 class ProductsScreen extends StatefulWidget {
@@ -15,7 +16,8 @@ class ProductsScreen extends StatefulWidget {
   State<ProductsScreen> createState() => _ProductsScreenState();
 }
 
-class _ProductsScreenState extends State<ProductsScreen> {
+class _ProductsScreenState extends State<ProductsScreen>
+    with AppEventsRefresh<ProductsScreen> {
   late final ProductsController _controller;
   final _searchCtrl = TextEditingController();
 
@@ -25,7 +27,14 @@ class _ProductsScreenState extends State<ProductsScreen> {
     _controller = ProductsController();
     _controller.addListener(_onStateChanged);
     _controller.loadData();
+    listenDataChanges();
   }
+
+  @override
+  void onDataChanged() {}
+
+  @override
+  void onCatalogChanged() => _controller.loadData();
 
   @override
   void deactivate() {
@@ -35,6 +44,7 @@ class _ProductsScreenState extends State<ProductsScreen> {
 
   @override
   void dispose() {
+    cancelDataChanges();
     _controller.dispose();
     _searchCtrl.dispose();
     super.dispose();
@@ -112,7 +122,8 @@ class _ProductsScreenState extends State<ProductsScreen> {
           children: [
             _FormSection(
               children: [
-                _formField('Nama Produk *', nameCtrl, hint: 'Contoh: Teh Manis'),
+                _formField('Nama Produk *', nameCtrl,
+                    hint: 'Contoh: Teh Manis'),
                 const Divider(height: 1, color: AppColors.border),
                 _categoryField(state, selectedCatId,
                     (v) => setModalState(() => selectedCatId = v)),
@@ -152,8 +163,7 @@ class _ProductsScreenState extends State<ProductsScreen> {
                       Navigator.push(
                         context,
                         MaterialPageRoute(
-                          builder: (_) =>
-                              ProductAddonsScreen(product: product),
+                          builder: (_) => ProductAddonsScreen(product: product),
                         ),
                       ).then((_) => _controller.loadData());
                     },
@@ -200,6 +210,7 @@ class _ProductsScreenState extends State<ProductsScreen> {
                     price: rawPrice,
                     categoryId: selectedCatId,
                     stock: product.stock,
+                    photoUrl: product.photoUrl,
                     isDeleted: product.isDeleted,
                     createdAt: product.createdAt,
                     updatedAt: DateTime.now(),
@@ -244,8 +255,8 @@ class _ProductsScreenState extends State<ProductsScreen> {
     );
   }
 
-  Widget _categoryField(ProductsState state, String? selected,
-      ValueChanged<String?> onChanged) {
+  Widget _categoryField(
+      ProductsState state, String? selected, ValueChanged<String?> onChanged) {
     return Padding(
       padding: const EdgeInsets.symmetric(
           horizontal: AppSpacing.md, vertical: AppSpacing.sm),
@@ -266,8 +277,8 @@ class _ProductsScreenState extends State<ProductsScreen> {
               hint: Text('Pilih kategori',
                   style: AppType.body.copyWith(color: AppColors.textTertiary)),
               items: state.categories
-                  .map((c) =>
-                      DropdownMenuItem(value: c.id, child: Text(c.name)))
+                  .map(
+                      (c) => DropdownMenuItem(value: c.id, child: Text(c.name)))
                   .toList(),
               onChanged: onChanged,
             ),
@@ -583,8 +594,8 @@ class _ProductsScreenState extends State<ProductsScreen> {
 
   Widget _syncBanner() {
     return Padding(
-      padding:
-          EdgeInsets.fromLTRB(context.pagePadX, AppSpacing.sm, context.pagePadX, 0),
+      padding: EdgeInsets.fromLTRB(
+          context.pagePadX, AppSpacing.sm, context.pagePadX, 0),
       child: Container(
         width: double.infinity,
         padding: const EdgeInsets.symmetric(
@@ -623,8 +634,7 @@ class _ProductsScreenState extends State<ProductsScreen> {
         style: AppType.body,
         decoration: const InputDecoration(
           hintText: 'Cari produk...',
-          prefixIcon:
-              Icon(Icons.search_rounded, color: AppColors.moduleProduk),
+          prefixIcon: Icon(Icons.search_rounded, color: AppColors.moduleProduk),
           filled: true,
           fillColor: AppColors.surface,
           contentPadding: EdgeInsets.symmetric(vertical: AppSpacing.sm),
@@ -760,7 +770,8 @@ class _ProductCard extends StatelessWidget {
           children: [
             // Avatar besar mengisi atas kartu
             Expanded(
-              child: MenuAvatar.fill(name: product.name),
+              child: ProductPhoto.fill(
+                  name: product.name, photoUrl: product.photoUrl),
             ),
             const SizedBox(height: AppSpacing.xs),
             SizedBox(

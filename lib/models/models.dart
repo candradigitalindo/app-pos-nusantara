@@ -103,6 +103,7 @@ class Product {
   final String name;
   final String? code;
   final String? description;
+  final String photoUrl;
   final double price;
   final int stock;
   final String? categoryId;
@@ -115,6 +116,7 @@ class Product {
     required this.name,
     this.code,
     this.description,
+    this.photoUrl = '',
     required this.price,
     this.stock = 0,
     this.categoryId,
@@ -123,11 +125,27 @@ class Product {
     required this.updatedAt,
   });
 
+  /// Update visual catalog data without repricing a cart already in progress.
+  Product withPhotoUrl(String value) => Product(
+        id: id,
+        name: name,
+        code: code,
+        description: description,
+        photoUrl: value,
+        price: price,
+        stock: stock,
+        categoryId: categoryId,
+        isDeleted: isDeleted,
+        createdAt: createdAt,
+        updatedAt: updatedAt,
+      );
+
   Map<String, dynamic> toMap() => {
         'id': id,
         'name': name,
         'code': code,
         'description': description,
+        'photo_url': isDeleted == 1 ? '' : photoUrl,
         'price': price,
         'stock': stock,
         'category_id': categoryId,
@@ -141,6 +159,8 @@ class Product {
         name: map['name'] as String,
         code: map['code'] as String?,
         description: map['description'] as String?,
+        photoUrl:
+            map['is_deleted'] == 1 ? '' : (map['photo_url'] as String? ?? ''),
         price: (map['price'] as num).toDouble(),
         stock: map['stock'] as int,
         categoryId: map['category_id'] as String?,
@@ -205,7 +225,8 @@ class Order {
   final String paymentStatus; // unpaid, partial, paid
   final String? mergedFrom;
   final int isMerged;
-  final int isHolding; // 1 = order "Meja Titipan" (parked check), bukan tamu aktif
+  final int
+      isHolding; // 1 = order "Meja Titipan" (parked check), bukan tamu aktif
   final DateTime? voidedAt;
   final String? voidedBy;
   final String? voidReason;
@@ -320,7 +341,8 @@ class OrderItem {
   final String orderId;
   final String? productId;
   final String productName;
-  final String? categoryId; // kategori asal item (untuk routing cetak per-printer)
+  final String?
+      categoryId; // kategori asal item (untuk routing cetak per-printer)
   final int qty;
   final double price;
   final String destination; // kitchen, bar

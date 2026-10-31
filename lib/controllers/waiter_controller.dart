@@ -155,6 +155,20 @@ class WaiterController extends ChangeNotifier {
   WaiterState _state = const WaiterState();
   WaiterState get state => _state;
 
+  Future<void> refreshProductPhotos() async {
+    try {
+      final latest = await _productRepo.getProducts();
+      final urls = {for (final product in latest) product.id: product.photoUrl};
+      _setState(_state.copyWith(
+        products: _state.products
+            .map((p) => p.withPhotoUrl(urls[p.id] ?? ''))
+            .toList(),
+        productCache: _state.productCache
+            .map((id, p) => MapEntry(id, p.withPhotoUrl(urls[id] ?? ''))),
+      ));
+    } catch (_) {}
+  }
+
   WaiterController({
     OrderRepository? orderRepo,
     ProductRepository? productRepo,

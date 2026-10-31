@@ -136,7 +136,9 @@ class _CashierStationScreenState extends State<CashierStationScreen> {
 
   void _connectSocket() {
     _api.connectWebSocket((event, _) {
-      if (event == 'order_created' ||
+      if (event == 'catalog_updated') {
+        _c.refreshProductPhotos();
+      } else if (event == 'order_created' ||
           event == 'order_items_added' ||
           event == 'order_paid' ||
           event == 'order_updated') {
@@ -201,8 +203,10 @@ class _CashierStationScreenState extends State<CashierStationScreen> {
   void _mainOnly(String label) =>
       _snack('$label hanya tersedia di perangkat utama', isError: true);
 
-  String _msg(Object e) =>
-      e.toString().replaceFirst('Exception: ', '').replaceFirst('Exception:', '');
+  String _msg(Object e) => e
+      .toString()
+      .replaceFirst('Exception: ', '')
+      .replaceFirst('Exception:', '');
 
   // ══════════════════════════════════════════════════════════════════════════
   // Meja & order
@@ -401,7 +405,8 @@ class _CashierStationScreenState extends State<CashierStationScreen> {
           final fresh = await _api.getOrderFull(id);
           final order = fresh['order'];
           if (order is Map && order['payment_status'] == 'paid') {
-            await _finishPaid(full, {'paid_amount': total, 'change': 0}, method);
+            await _finishPaid(
+                full, {'paid_amount': total, 'change': 0}, method);
             return;
           }
         } catch (_) {}
@@ -417,7 +422,8 @@ class _CashierStationScreenState extends State<CashierStationScreen> {
     await _printReceipt(full, result, method);
     // Laci kasir station dibuka di PERANGKAT INI (laci menempel pada printer
     // struk station), bukan di Main POS yang mencatat pembayarannya.
-    unawaited(CashDrawerService.instance.openAfterPayment(paymentMethod: method));
+    unawaited(
+        CashDrawerService.instance.openAfterPayment(paymentMethod: method));
     _clearCart();
     if (!mounted) return;
     setState(() {
@@ -699,7 +705,8 @@ class _CashierStationScreenState extends State<CashierStationScreen> {
   /// Hapus (void) satu item terkirim — wajib PIN Manager/SVP/Admin.
   Future<void> _showItemVoidDialog(Map<String, dynamic> item) async {
     final maxQty = (item['qty'] as num?)?.toInt() ?? 1;
-    final n = maxQty <= 1 ? 1 : await _askQty(maxQty, title: 'Void berapa unit?');
+    final n =
+        maxQty <= 1 ? 1 : await _askQty(maxQty, title: 'Void berapa unit?');
     if (n == null || !mounted) return;
     final price = (item['price'] as num?)?.toDouble() ?? 0;
     final auth = await showPinAuthDialog(
@@ -799,8 +806,8 @@ class _CashierStationScreenState extends State<CashierStationScreen> {
         cashierName: _cashierName,
       );
       await _sendToCashierPrinter(
-          (cols, isCopy) =>
-              ReceiptBuilder(paperWidth: cols).buildReceipt(data, isCopy: isCopy),
+          (cols, isCopy) => ReceiptBuilder(paperWidth: cols)
+              .buildReceipt(data, isCopy: isCopy),
           honorCopies: true);
     } catch (e) {
       debugPrint('Cetak struk station error: $e');
@@ -1056,14 +1063,14 @@ class _CashierStationScreenState extends State<CashierStationScreen> {
 
   Future<void> _printSession(Map<String, dynamic> summary) async {
     try {
-      await _sendToCashierPrinter((cols, _) =>
-          ReceiptBuilder(paperWidth: cols).buildCashierSession(
-            outletName: 'POS Resto',
-            cashierName: _cashierName,
-            loginAt: _loginAt,
-            endAt: DateTime.now(),
-            summary: summary,
-          ));
+      await _sendToCashierPrinter(
+          (cols, _) => ReceiptBuilder(paperWidth: cols).buildCashierSession(
+                outletName: 'POS Resto',
+                cashierName: _cashierName,
+                loginAt: _loginAt,
+                endAt: DateTime.now(),
+                summary: summary,
+              ));
     } catch (e) {
       debugPrint('Cetak ringkasan sesi error: $e');
     }
@@ -1552,8 +1559,7 @@ class _CashierStationScreenState extends State<CashierStationScreen> {
               _billRow('Subtotal', _orderSubtotal),
               const SizedBox(height: 4),
               ...charges.map((c) {
-                final applied =
-                    (c['applied_amount'] as num?)?.toDouble() ?? 0;
+                final applied = (c['applied_amount'] as num?)?.toDouble() ?? 0;
                 return Padding(
                   padding: const EdgeInsets.only(bottom: 4),
                   child: _billRow(
@@ -1914,7 +1920,8 @@ class _CashierStationScreenState extends State<CashierStationScreen> {
                                       AppType.h3.copyWith(color: Colors.white)),
                               Text('Menunggu shift dibuka',
                                   style: AppType.caption.copyWith(
-                                      color: AppColors.soft(Colors.white, 0.85))),
+                                      color:
+                                          AppColors.soft(Colors.white, 0.85))),
                             ],
                           ),
                         ),

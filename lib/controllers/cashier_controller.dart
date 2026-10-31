@@ -79,8 +79,7 @@ class CashierState {
   int get cartItemCount => cart.values.fold(0, (sum, qty) => sum + qty);
 
   /// Subtotal item order aktif (sebelum charge/diskon).
-  double get orderSubtotal =>
-      orderItems.fold(0.0, (s, i) => s + i.subtotal);
+  double get orderSubtotal => orderItems.fold(0.0, (s, i) => s + i.subtotal);
 
   CashierState copyWith({
     List<Category>? categories,
@@ -177,6 +176,20 @@ class CashierController extends ChangeNotifier {
   }
 
   // ── Data Loading ──────────────────────────────────────────────────────────
+
+  Future<void> refreshProductPhotos() async {
+    try {
+      final latest = await _productRepo.getProducts();
+      final urls = {for (final product in latest) product.id: product.photoUrl};
+      _setState(_state.copyWith(
+        products: _state.products
+            .map((p) => p.withPhotoUrl(urls[p.id] ?? ''))
+            .toList(),
+        productCache: _state.productCache
+            .map((id, p) => MapEntry(id, p.withPhotoUrl(urls[id] ?? ''))),
+      ));
+    } catch (_) {}
+  }
 
   Future<void> loadData() async {
     _setState(_state.copyWith(isLoading: true, clearError: true));
@@ -580,7 +593,8 @@ class CashierController extends ChangeNotifier {
         customerName: _state.customerName,
         customerPhone: _state.customerPhone,
         createdBy: orderedBy,
-        waiterName: orderedBy, // catat pemesan di tiap item (untuk multi-pemesan)
+        waiterName:
+            orderedBy, // catat pemesan di tiap item (untuk multi-pemesan)
       );
 
       await _loadOrderItems(order.id);
@@ -677,8 +691,8 @@ class CashierController extends ChangeNotifier {
           result, orderSnapshot, orderItemsSnapshot, charges);
 
       // Laci kasir: buka otomatis setelah lunas (ikut Pengaturan Printer).
-      unawaited(CashDrawerService.instance.openAfterPayment(
-          paymentMethod: method));
+      unawaited(
+          CashDrawerService.instance.openAfterPayment(paymentMethod: method));
 
       _setState(_state.copyWith(
         currentOrder: null,
@@ -770,8 +784,8 @@ class CashierController extends ChangeNotifier {
           charges,
         );
         // Laci kasir: bagian terakhir split/gabung bayar → tagihan lunas.
-        unawaited(CashDrawerService.instance.openAfterPayment(
-            paymentMethod: method));
+        unawaited(
+            CashDrawerService.instance.openAfterPayment(paymentMethod: method));
         _setState(_state.copyWith(
           currentOrder: null,
           clearCurrentOrder: true,
@@ -1245,8 +1259,8 @@ class CashierController extends ChangeNotifier {
               orElse: () => saved.first,
             );
 
-      final bytes = ReceiptBuilder(paperWidth: printer.paperCols)
-          .buildShiftReport(
+      final bytes =
+          ReceiptBuilder(paperWidth: printer.paperCols).buildShiftReport(
         title: title,
         outletName: outlet.name.isNotEmpty ? outlet.name : 'POS Resto',
         shift: shift,
@@ -1263,7 +1277,6 @@ class CashierController extends ChangeNotifier {
       debugPrint('Cetak laporan shift error: $e');
     }
   }
-
 
   String _ordererName(Order order) =>
       (order.createdBy?.isNotEmpty ?? false) ? order.createdBy! : 'Kasir';
@@ -1387,7 +1400,8 @@ class CashierController extends ChangeNotifier {
 
     final paid = payments.fold<double>(0, (s, p) => s + p.amount);
     final method = payments.isNotEmpty ? payments.first.paymentMethod : 'cash';
-    final change = (paid - order.totalAmount) > 0 ? paid - order.totalAmount : 0.0;
+    final change =
+        (paid - order.totalAmount) > 0 ? paid - order.totalAmount : 0.0;
     final o = await _outletService.loadOutlet();
     final subtotal = items.fold<double>(0, (s, i) => s + i.subtotal);
 

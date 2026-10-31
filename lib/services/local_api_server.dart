@@ -16,6 +16,7 @@ import '../repositories/product_repository.dart';
 import '../repositories/table_repository.dart';
 import '../utils/ulid.dart';
 import 'app_events.dart';
+import 'product_photo_cache.dart';
 
 /// HTTP + WebSocket server yang berjalan di Main POS.
 /// Waiter station terhubung ke server ini via WiFi lokal cafe.
@@ -27,6 +28,8 @@ class LocalApiServer {
 
   HttpServer? _httpServer;
   final Set<WebSocketChannel> _wsClients = {};
+  StreamSubscription<String>? _photoStored;
+  Timer? _photoReadyDebounce;
 
   final _orderRepo = OrderRepository();
   final _productRepo = ProductRepository();
@@ -48,6 +51,7 @@ class LocalApiServer {
       ..get('/api/tables', _getTables)
       ..get('/api/categories', _getCategories)
       ..get('/api/products', _getProducts)
+      ..get('/api/products/<id>/photo', _getProductPhoto)
       ..get('/api/orders/active', _getActiveOrders)
       ..get('/api/orders/<id>', _getOrder)
       ..post('/api/orders', _createOrder)
@@ -86,10 +90,22 @@ class LocalApiServer {
       InternetAddress.anyIPv4,
       port,
     );
-    _port = port;
+    _port = _httpServer!.port;
+    // Metadata can arrive before its image finishes downloading. Inform LAN
+    // stations when Main POS can actually serve the warmed cache as well.
+    _photoStored = ProductPhotoCache.instance.onStored.listen((_) {
+      _photoReadyDebounce?.cancel();
+      _photoReadyDebounce = Timer(const Duration(milliseconds: 350), () {
+        if (isRunning) broadcast('catalog_updated', const {});
+      });
+    });
   }
 
   Future<void> stop() async {
+    await _photoStored?.cancel();
+    _photoStored = null;
+    _photoReadyDebounce?.cancel();
+    _photoReadyDebounce = null;
     for (final client in List.of(_wsClients)) {
       await client.sink.close();
     }
@@ -319,9 +335,67 @@ class LocalApiServer {
     try {
       final categoryId = req.url.queryParameters['category_id'];
       final products = await _productRepo.getProducts(categoryId: categoryId);
-      return _ok(products.map((p) => p.toMap()).toList());
+      final rows = <Map<String, dynamic>>[];
+      for (final product in products) {
+        final row = product.toMap();
+        if (product.photoUrl.isNotEmpty &&
+            await ProductPhotoCache.instance.cachedFile(product.photoUrl) !=
+                null) {
+          final version =
+              sha256.convert(utf8.encode(product.photoUrl)).toString();
+          row['photo_cache_path'] =
+              '/api/products/${Uri.encodeComponent(product.id)}/photo?v=$version';
+        }
+        rows.add(row);
+      }
+      return _ok(rows);
     } catch (e) {
       return _serverError('$e');
+    }
+  }
+
+  /// Session-protected image route. The client supplies only a product ID and
+  /// version; the file/URL is resolved from the current active product record.
+  Future<Response> _getProductPhoto(Request req, String id) async {
+    try {
+      final db = await AppDatabase.instance.database;
+      final rows = await db.query('products',
+          columns: ['photo_url'],
+          where: 'id = ? AND is_deleted = 0',
+          whereArgs: [id],
+          limit: 1);
+      final url = rows.isEmpty ? '' : rows.single['photo_url'] as String? ?? '';
+      if (url.isEmpty) return _notFound('Foto produk tidak tersedia');
+      final version = sha256.convert(utf8.encode(url)).toString();
+      if (req.url.queryParameters['v'] != version) {
+        return _notFound('Versi foto produk sudah berubah');
+      }
+      final file = await ProductPhotoCache.instance.cachedFile(url);
+      if (file == null) return _notFound('Foto produk belum tersimpan');
+      final signature = await file
+          .openRead(0, 16)
+          .fold<List<int>>(<int>[], (bytes, part) => bytes..addAll(part));
+      final type =
+          signature.length >= 3 && signature[0] == 0xff && signature[1] == 0xd8
+              ? 'image/jpeg'
+              : signature.length >= 4 &&
+                      signature[0] == 0x89 &&
+                      signature[1] == 0x50
+                  ? 'image/png'
+                  : signature.length >= 3 &&
+                          signature[0] == 0x47 &&
+                          signature[1] == 0x49
+                      ? 'image/gif'
+                      : 'image/webp';
+      return Response.ok(file.openRead(), headers: {
+        'content-type': type,
+        'content-length': '${await file.length()}',
+        'cache-control': 'private, max-age=31536000, immutable',
+        'etag': '"$version"',
+        'x-content-type-options': 'nosniff',
+      });
+    } catch (_) {
+      return _notFound('Foto produk tidak tersedia');
     }
   }
 
@@ -832,7 +906,9 @@ class LocalApiServer {
       return _badRequest('Body JSON tidak valid');
     }
     final table = body['table_number'] as String?;
-    if (table == null || table.isEmpty) return _badRequest('table_number wajib');
+    if (table == null || table.isEmpty) {
+      return _badRequest('table_number wajib');
+    }
     try {
       await _orderRepo.moveOrderToTable(orderId: id, newTableNumber: table);
       broadcast('order_updated', {'order_id': id});
@@ -930,7 +1006,6 @@ class LocalApiServer {
       return _serverError('$e');
     }
   }
-
 
   // ── Response helpers ──────────────────────────────────────────────────────
 

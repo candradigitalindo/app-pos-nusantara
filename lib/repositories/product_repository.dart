@@ -145,9 +145,12 @@ class ProductRepository {
   }
 
   Future<void> updateProduct(Product product) async {
+    // Cloud owns photos. An edit dialog may still hold the previous URL
+    // after a photo update/delete has already committed through sync.
+    final changes = product.toMap()..remove('photo_url');
     await _db.update(
       'products',
-      product.toMap(),
+      changes,
       where: 'id = ?',
       whereArgs: [product.id],
     );
@@ -162,7 +165,7 @@ class ProductRepository {
   Future<void> deleteProduct(String id) async {
     await _db.update(
       'products',
-      {'is_deleted': 1},
+      {'is_deleted': 1, 'photo_url': ''},
       where: 'id = ?',
       whereArgs: [id],
     );
@@ -220,8 +223,7 @@ class ProductRepository {
       GROUP BY product_id
     ''');
     return {
-      for (final r in rows)
-        r['product_id'] as String: (r['n'] as num).toInt(),
+      for (final r in rows) r['product_id'] as String: (r['n'] as num).toInt(),
     };
   }
 
