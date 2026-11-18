@@ -253,22 +253,31 @@ Future<bool> showAppConfirm(
   return result ?? false;
 }
 
-/// Snackbar seragam (sukses / error / info).
+/// Snackbar seragam (sukses / peringatan / error).
 void showAppSnack(
   BuildContext context,
   String message, {
   bool isError = false,
+  bool isWarning = false,
   IconData? icon,
 }) {
-  final color = isError ? AppColors.danger : AppColors.success;
+  final color = isError
+      ? AppColors.danger
+      : isWarning
+          ? AppColors.warning
+          : AppColors.success;
+  final defaultIcon = isError
+      ? Icons.error_outline_rounded
+      : isWarning
+          ? Icons.warning_amber_rounded
+          : Icons.check_circle_outline_rounded;
   ScaffoldMessenger.of(context)
     ..hideCurrentSnackBar()
     ..showSnackBar(
       SnackBar(
         content: Row(
           children: [
-            Icon(icon ?? (isError ? Icons.error_outline_rounded : Icons.check_circle_outline_rounded),
-                color: color, size: 20),
+            Icon(icon ?? defaultIcon, color: color, size: 20),
             const SizedBox(width: AppSpacing.sm),
             Expanded(child: Text(message)),
           ],

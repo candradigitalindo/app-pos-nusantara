@@ -82,4 +82,69 @@ void main() {
       {'local_id': 'product', 'status': 'failed'},
     ]), isEmpty);
   });
+
+  group('rejectedSyncQueueErrors', () {
+    test('explicit rejection carries the cloud reason', () {
+      final rows = [
+        queued(1, 'transaction', 'trx'),
+        queued(2, 'order', 'order'),
+      ];
+      final rejected = rejectedSyncQueueErrors(rows, [
+        {'entity_type': 'transaction', 'local_id': 'trx', 'status': 'success'},
+        {
+          'entity_type': 'order',
+          'local_id': 'order',
+          'status': 'failed',
+          'error': 'produk harus cocok; ditemukan 0',
+        },
+      ]);
+      expect(rejected, {2: 'produk harus cocok; ditemukan 0'});
+    });
+
+    test('void events are matched by event id, not by item', () {
+      final rows = [
+        queued(1, 'order_item_void', 'item', eventId: 'event-a'),
+        queued(2, 'order_item_void', 'item', eventId: 'event-b'),
+      ];
+      final rejected = rejectedSyncQueueErrors(rows, [
+        {
+          'entity_type': 'order_item_void',
+          'local_id': 'item',
+          'event_id': 'event-b',
+          'status': 'failed',
+          'error': 'ditemukan 2',
+        },
+        {
+          'entity_type': 'order_item_void',
+          'local_id': 'item',
+          'event_id': 'event-a',
+          'status': 'success',
+        },
+      ]);
+      expect(rejected, {2: 'ditemukan 2'});
+    });
+
+    test('missing, ambiguous or cross-type answers are not rejections', () {
+      final rows = [queued(1, 'order', 'same')];
+      expect(rejectedSyncQueueErrors(rows, []), isEmpty);
+      expect(
+          rejectedSyncQueueErrors(rows, [
+            {'entity_type': 'transaction', 'local_id': 'same', 'status': 'failed'},
+          ]),
+          isEmpty);
+      expect(
+          rejectedSyncQueueErrors(rows, [
+            {'local_id': 'same', 'status': 'failed'},
+            {'local_id': 'same', 'status': 'failed'},
+          ]),
+          isEmpty);
+    });
+
+    test('rejection without a reason still gets a readable message', () {
+      final rejected = rejectedSyncQueueErrors([queued(1, 'order', 'o')], [
+        {'entity_type': 'order', 'local_id': 'o', 'status': 'failed'},
+      ]);
+      expect(rejected[1], 'Ditolak cloud tanpa keterangan');
+    });
+  });
 }

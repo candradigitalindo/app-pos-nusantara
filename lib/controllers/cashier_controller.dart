@@ -1250,18 +1250,22 @@ class CashierController extends ChangeNotifier {
   }
 
   /// Cetak laporan TUTUP KASIR / GANTI SHIFT ke printer kasir.
-  /// Dipanggil SETELAH shift ditutup/diganti (closed_at sudah tersimpan &
-  /// laporan sudah terkirim ke cloud), agar angka struk == angka cloud.
-  Future<void> _printShiftReport(
+  /// Dipanggil SETELAH shift ditutup/diganti. Isi laporan diambil dari
+  /// snapshot yang dibekukan saat penutupan (identik dengan payload cloud),
+  /// jadi cetak ulang kapan pun menghasilkan angka & daftar menu yang sama.
+  /// Mengembalikan null bila sudah masuk antrean cetak, atau pesan kesalahan.
+  Future<String?> _printShiftReport(
     CashierShift shift, {
     required String title,
     String? handoverToName,
     double? countedCash,
     DateTime? closedAt,
+    bool reprint = false,
   }) async {
     try {
-      final report = await _cashierRepo.getShiftReport(shift.id);
-      if (report.isEmpty) return;
+      final closing = await _cashierRepo.getClosingReport(shift.id);
+      final report = closing.report;
+      if (report.isEmpty) return 'Laporan shift tidak tersedia.';
       final movements = await _cashierRepo.getShiftMovements(shift.id);
       final outlet = await _outletService.loadOutlet();
 
@@ -1269,7 +1273,7 @@ class CashierController extends ChangeNotifier {
       final saved = await printerService.getSavedPrinters();
       if (saved.isEmpty) {
         debugPrint('Cetak laporan shift: tidak ada printer tersimpan.');
-        return;
+        return 'Belum ada printer tersimpan. Atur printer kasir di Pengaturan.';
       }
       // Printer ber-role 'cashier', fallback printer non-checker, lalu pertama.
       final cashierPrinters =
@@ -1291,13 +1295,48 @@ class CashierController extends ChangeNotifier {
         closedAt: closedAt ?? DateTime.now(),
         handoverToName: handoverToName,
         countedCash: countedCash,
+        reprintedAt: reprint ? DateTime.now() : null,
+        recomputed: !closing.frozen,
       );
       // Lewat antrian cetak (durable + bisa cetak ulang bila gagal).
-      await PrintQueueService.instance
-          .enqueueForPrinter(printer, bytes: bytes, label: title);
+      await PrintQueueService.instance.enqueueForPrinter(printer,
+          bytes: bytes, label: reprint ? '$title (cetak ulang)' : title);
+      return null;
     } catch (e) {
       debugPrint('Cetak laporan shift error: $e');
+      return 'Gagal mencetak laporan: '
+          '${e.toString().replaceFirst('Exception: ', '')}';
     }
+  }
+
+  /// Shift yang sudah ditutup (terbaru dulu) untuk daftar cetak ulang.
+  Future<
+      List<
+          ({
+            CashierShift shift,
+            double? salesTotal,
+            int? salesCount,
+            bool frozen
+          })>> getRecentClosedShifts() => _cashierRepo.getRecentClosedShifts();
+
+  /// Cetak ulang laporan TUTUP KASIR / GANTI SHIFT sebuah shift yang sudah
+  /// ditutup. Isinya sama persis dengan cetakan pertama (snapshot penutupan),
+  /// ditandai "CETAK ULANG" beserta waktu cetaknya.
+  /// Mengembalikan null bila masuk antrean cetak, atau pesan kesalahan.
+  Future<String?> reprintShiftReport(String shiftId) async {
+    final shift = await _cashierRepo.getShiftById(shiftId);
+    if (shift == null) return 'Shift tidak ditemukan.';
+    if (shift.isOpen) return 'Shift ini belum ditutup.';
+    final handover = (shift.handoverTo ?? '').trim();
+    return _printShiftReport(
+      shift,
+      title: handover.isNotEmpty ? 'GANTI SHIFT' : 'TUTUP KASIR',
+      handoverToName: handover.isNotEmpty ? handover : null,
+      // Ganti shift: kas yang diserahkan = modal shift berikutnya (carry over).
+      countedCash: handover.isNotEmpty ? shift.carryOverCash : null,
+      closedAt: shift.closedAt,
+      reprint: true,
+    );
   }
 
   String _ordererName(Order order) =>

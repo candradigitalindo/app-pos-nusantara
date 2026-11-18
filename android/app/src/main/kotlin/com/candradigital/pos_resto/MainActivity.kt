@@ -1,21 +1,48 @@
 package com.candradigital.pos_resto
 
 import android.app.ActivityManager
+import android.app.PendingIntent
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageInstaller
+import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.Environment
 import android.os.StatFs
 import android.os.SystemClock
+import android.provider.Settings
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.io.File
 import java.io.RandomAccessFile
 
 class MainActivity : FlutterActivity() {
     private val channel = "pos/device"
+    private var updateChannel: MethodChannel? = null
+
+    companion object {
+        private const val UPDATE_CHANNEL = "pos/app_update"
+        private const val ACTION_INSTALL_STATUS = "com.candradigital.pos_resto.INSTALL_STATUS"
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        // Activity bisa dibuat ulang oleh PendingIntent status pemasangan.
+        if (handleInstallStatus(intent)) {
+            setIntent(Intent(this, MainActivity::class.java).setAction(Intent.ACTION_MAIN))
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleInstallStatus(intent)
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        configureAppUpdateChannel(flutterEngine)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channel)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
@@ -66,6 +93,158 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+    }
+
+    // ── Pembaruan dalam-aplikasi ─────────────────────────────────────────────
+
+    private fun configureAppUpdateChannel(flutterEngine: FlutterEngine) {
+        updateChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, UPDATE_CHANNEL)
+        updateChannel?.setMethodCallHandler { call, result ->
+            when (call.method) {
+                // Sudah diizinkan "Instal aplikasi tak dikenal" untuk POS?
+                "canInstall" -> result.success(canInstallPackages())
+                "openInstallSettings" -> {
+                    try {
+                        openInstallSettings()
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("SETTINGS_ERR", e.message, null)
+                    }
+                }
+                "install" -> {
+                    val path = call.argument<String>("path")
+                    if (path.isNullOrEmpty()) {
+                        result.error("ARG", "path wajib diisi", null)
+                    } else {
+                        installApk(path, result)
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
+    }
+
+    private fun canInstallPackages(): Boolean =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            packageManager.canRequestPackageInstalls()
+        } else {
+            true
+        }
+
+    private fun openInstallSettings() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startActivity(
+                Intent(
+                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:$packageName")
+                )
+            )
+        }
+    }
+
+    /// Pasang APK lewat sesi PackageInstaller. Paket dikunci ke aplikasi ini
+    /// (setAppPackageName) dan Android sendiri menolak APK bertanda tangan lain,
+    /// jadi hanya pembaruan POS yang sah yang bisa terpasang. Penulisan APK
+    /// (puluhan MB) di thread latar agar UI tidak macet (ANR).
+    private fun installApk(path: String, result: MethodChannel.Result) {
+        val file = File(path)
+        if (!file.isFile) {
+            result.error("NO_FILE", "File pembaruan tidak ditemukan", null)
+            return
+        }
+        Thread {
+            try {
+                val installer = packageManager.packageInstaller
+                val params = PackageInstaller.SessionParams(
+                    PackageInstaller.SessionParams.MODE_FULL_INSTALL
+                )
+                params.setAppPackageName(packageName)
+                params.setSize(file.length())
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    // Android 12+: pembaruan diri sendiri boleh tanpa ketukan bila
+                    // syarat sistem terpenuhi; bila tidak, Android tetap meminta
+                    // konfirmasi (STATUS_PENDING_USER_ACTION).
+                    params.setRequireUserAction(
+                        PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED
+                    )
+                }
+                val sessionId = installer.createSession(params)
+                installer.openSession(sessionId).use { session ->
+                    file.inputStream().use { input ->
+                        session.openWrite("pos-update.apk", 0, file.length()).use { output ->
+                            input.copyTo(output)
+                            session.fsync(output)
+                        }
+                    }
+                    val statusIntent = Intent(this, MainActivity::class.java)
+                        .setAction(ACTION_INSTALL_STATUS)
+                        .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                    var flags = PendingIntent.FLAG_UPDATE_CURRENT
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        flags = flags or PendingIntent.FLAG_MUTABLE
+                    }
+                    val pending = PendingIntent.getActivity(this, sessionId, statusIntent, flags)
+                    session.commit(pending.intentSender)
+                }
+                runOnUiThread {
+                    try {
+                        result.success("committed")
+                    } catch (e: Throwable) {
+                        // channel sudah tidak aktif — abaikan
+                    }
+                }
+            } catch (e: Throwable) {
+                runOnUiThread {
+                    try {
+                        result.error("INSTALL_FAILED", e.message ?: e.javaClass.simpleName, null)
+                    } catch (ignored: Throwable) {
+                    }
+                }
+            }
+        }.start()
+    }
+
+    /// Status sesi pemasangan dari sistem. true bila intent memang status
+    /// pemasangan (sudah ditangani).
+    private fun handleInstallStatus(intent: Intent?): Boolean {
+        if (intent == null || intent.action != ACTION_INSTALL_STATUS) return false
+        when (intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)) {
+            PackageInstaller.STATUS_PENDING_USER_ACTION -> {
+                val confirm: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(Intent.EXTRA_INTENT, Intent::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(Intent.EXTRA_INTENT)
+                }
+                if (confirm == null) {
+                    reportInstall("failure", "Dialog pemasangan Android tidak tersedia")
+                } else {
+                    try {
+                        startActivity(confirm)
+                        reportInstall("pending_user_action", null)
+                    } catch (e: Exception) {
+                        reportInstall("failure", e.message)
+                    }
+                }
+            }
+            PackageInstaller.STATUS_SUCCESS -> reportInstall("success", null)
+            else -> reportInstall(
+                "failure",
+                intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE)
+            )
+        }
+        return true
+    }
+
+    private fun reportInstall(status: String, message: String?) {
+        try {
+            updateChannel?.invokeMethod(
+                "installStatus",
+                mapOf("status" to status, "message" to message)
+            )
+        } catch (e: Throwable) {
+            // Dart belum siap / channel sudah dilepas — abaikan
+        }
     }
 
     /// Kumpulkan RAM + CPU. RAM selalu ada. %CPU dari selisih dua sampling

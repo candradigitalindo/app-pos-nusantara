@@ -22,6 +22,7 @@ class _SyncStatusScreenState extends State<SyncStatusScreen> {
   static const _accent = AppColors.moduleKasir;
 
   Map<String, int> _stats = const {'pending': 0, 'success': 0, 'failed': 0};
+  int _rejected = 0;
   List<Map<String, dynamic>> _jobs = [];
   Map<String, dynamic> _recon = const {};
   bool _loading = true;
@@ -44,11 +45,13 @@ class _SyncStatusScreenState extends State<SyncStatusScreen> {
   Future<void> _load({bool silent = false}) async {
     if (!silent) setState(() => _loading = true);
     final stats = await _queue.stats();
+    final health = await _queue.health();
     final jobs = await _queue.recentJobs();
     final recon = await _queue.reconciliation();
     if (!mounted) return;
     setState(() {
       _stats = stats;
+      _rejected = health.rejected;
       _jobs = jobs;
       _recon = recon;
       _loading = false;
@@ -60,10 +63,19 @@ class _SyncStatusScreenState extends State<SyncStatusScreen> {
     final r = await CloudSyncService.instance.pushNow();
     if (!mounted) return;
     setState(() => _syncing = false);
+    final rejected = r['rejected'] ?? 0;
+    final failed = r['failed'] ?? 0;
     final msg = (r['unconfigured'] ?? 0) == 1
         ? 'Cloud belum dikonfigurasi (URL/API Key/Outlet ID)'
-        : 'Terkirim: ${r['success']} sukses, ${r['failed']} gagal (dari ${r['sent']})';
-    showAppSnack(context, msg);
+        : (r['network_error'] ?? 0) == 1
+            ? 'Cloud tidak terjangkau — ${r['sent']} data tetap antre di tablet'
+            : 'Terkirim: ${r['success']} sukses'
+                '${rejected > 0 ? ', $rejected ditolak cloud' : ''}'
+                '${failed > 0 ? ', $failed belum dikonfirmasi' : ''}'
+                ' (dari ${r['sent']})';
+    showAppSnack(context, msg,
+        isError: (r['network_error'] ?? 0) == 1,
+        isWarning: rejected > 0 || failed > 0);
     await _load();
   }
 
@@ -114,7 +126,8 @@ class _SyncStatusScreenState extends State<SyncStatusScreen> {
             ),
             _buildStatsBar(),
             _buildReconCard(),
-            if (failed > 0) _buildRetryBanner(failed),
+            if (failed > 0 || _rejected > 0)
+              _buildRetryBanner(failed, _rejected),
             Expanded(
               child: _loading
                   ? const AppLoader()
@@ -272,7 +285,7 @@ class _SyncStatusScreenState extends State<SyncStatusScreen> {
     );
   }
 
-  Widget _buildRetryBanner(int failed) {
+  Widget _buildRetryBanner(int failed, int rejected) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(
           AppSpacing.md, AppSpacing.xs, AppSpacing.md, 0),
@@ -287,7 +300,11 @@ class _SyncStatusScreenState extends State<SyncStatusScreen> {
                 color: AppColors.danger, size: 20),
             const SizedBox(width: AppSpacing.sm),
             Expanded(
-              child: Text('$failed item gagal terkirim ke cloud',
+              child: Text(
+                  rejected > 0
+                      ? '$rejected item ditolak cloud — alasannya tertera di '
+                          'daftar. Data lain tetap tersinkron.'
+                      : '$failed item gagal terkirim ke cloud',
                   style: AppType.bodySm.copyWith(
                       color: AppColors.danger, fontWeight: FontWeight.w700)),
             ),
@@ -312,10 +329,16 @@ class _JobTile extends StatelessWidget {
 
   static const _labels = {
     'transaction': 'Transaksi',
+    'order': 'Pesanan',
+    'order_item_void': 'Void Item',
+    'order_item_titipan': 'Titipan',
     'cashier_shift': 'Shift Kasir',
     'cashier_cash_movement': 'Kas Masuk/Keluar',
+    'additional_charge': 'Biaya Tambahan',
     'product': 'Produk',
+    'product_addon': 'Add-on Produk',
     'category': 'Kategori',
+    'printer': 'Printer',
   };
 
   @override
@@ -325,12 +348,21 @@ class _JobTile extends StatelessWidget {
     final op = job['operation'] as String? ?? '';
     final retry = job['retry_count'] as int? ?? 0;
     final error = job['error_message'] as String?;
+    final kind = job['error_kind'] as String?;
+    final rejected =
+        status != 'success' && kind == SyncQueueRepository.errorKindRejected;
 
     final (color, icon, text) = switch (status) {
       'success' => (AppColors.success, Icons.check_circle_rounded, 'Terkirim'),
+      _ when rejected =>
+        (AppColors.danger, Icons.report_problem_rounded, 'Ditolak'),
+      'failed' when kind == SyncQueueRepository.errorKindUnconfirmed =>
+        (AppColors.warning, Icons.schedule_rounded, 'Antri'),
       'failed' => (AppColors.danger, Icons.error_rounded, 'Gagal'),
       _ => (AppColors.warning, Icons.schedule_rounded, 'Antri'),
     };
+    final showError =
+        (status == 'failed' || rejected) && error != null && error.isNotEmpty;
 
     return AppCard(
       padding: const EdgeInsets.symmetric(
@@ -349,11 +381,11 @@ class _JobTile extends StatelessWidget {
                 const SizedBox(height: 2),
                 Text('$op${retry > 0 ? ' · retry $retry' : ''}',
                     style: AppType.caption),
-                if (status == 'failed' && error != null && error.isNotEmpty)
+                if (showError)
                   Padding(
                     padding: const EdgeInsets.only(top: 4),
                     child: Text(error,
-                        maxLines: 2,
+                        maxLines: 3,
                         overflow: TextOverflow.ellipsis,
                         style: AppType.caption.copyWith(color: AppColors.danger)),
                   ),

@@ -18,6 +18,9 @@ import 'outlet_service.dart';
 import 'product_photo_cache.dart';
 import 'app_events.dart';
 
+/// Status sinkron untuk indikator kasir — lihat [CloudSyncService.status].
+typedef SyncIndicator = ({bool enabled, int pending, int rejected, bool online});
+
 /// Mengirim outbox (sync_queue) ke cloud-pos via endpoint BatchSync.
 /// Meniru pola sync_worker.go di backend Go: push berkala + exponential
 /// backoff saat offline. Hanya PUSH (kasir → cloud) untuk fitur laporan shift.
@@ -41,8 +44,15 @@ class CloudSyncService {
 
   Timer? _timer;
   bool _pushBusy = false; // reentrancy guard khusus pushNow()
+  // Kegagalan JARINGAN beruntun (cloud tak terjangkau / balasan tak terbaca).
+  // Item yang ditolak cloud TIDAK dihitung: cloud jelas terjangkau, jadi tablet
+  // tidak boleh tampil "offline" atau menunda sinkron karenanya.
   int _consecutiveFails = 0;
   static const _maxBackoffMinutes = 30;
+  static const _batchLimit = 200;
+  // Batas putaran kirim per siklus: menguras backlog >1 batch dan item yang
+  // masuk selama siklus, tanpa membuat satu siklus berjalan tanpa akhir.
+  static const _maxPushRounds = 3;
 
   /// True selama satu siklus sinkron berjalan — baik otomatis (timer) maupun
   /// manual (tombol kasir). UI mendengarkan ini agar tombol ikut berputar saat
@@ -52,15 +62,17 @@ class CloudSyncService {
   bool get isSyncing => syncing.value;
 
   /// Status ringkas untuk indikator UI kasir.
-  /// [enabled] sync aktif?, [pending] jumlah item outbox belum terkirim,
-  /// [online] siklus terakhir tidak gagal jaringan.
-  Future<({bool enabled, int pending, bool online})> status() async {
+  /// [enabled] sync aktif?, [pending] item outbox yang belum dikonfirmasi
+  /// cloud, [rejected] item yang sampai ke cloud tetapi DITOLAK isinya (perlu
+  /// perbaikan data — bukan masalah koneksi), [online] cloud terjangkau pada
+  /// percobaan terakhir.
+  Future<SyncIndicator> status() async {
     final outlet = await _outletService.loadOutlet();
-    final stats = await _queue.stats();
-    final pending = (stats['pending'] ?? 0) + (stats['failed'] ?? 0);
+    final health = await _queue.health();
     return (
       enabled: outlet.syncEnabled,
-      pending: pending,
+      pending: health.waiting,
+      rejected: health.rejected,
       online: _consecutiveFails == 0,
     );
   }
@@ -149,9 +161,22 @@ class CloudSyncService {
     // pending untuk entity yang sama, jadi ini murah dan menutup celah drift.
     await _orderRepo.enqueueAllAdditionalCharges();
 
-    final pushed = await pushNow();
-    // Pull hanya jika push tidak gagal jaringan (hindari spam saat offline)
-    if ((pushed['failed'] ?? 0) == 0 || (pushed['sent'] ?? 0) == 0) {
+    var pushed = await pushNow();
+    // Kuras antrean dalam siklus yang sama: backlog lebih dari satu batch atau
+    // item yang masuk selama siklus berjalan. Item yang ditolak/tak dikonfirmasi
+    // sudah 'failed' sehingga tidak terkirim dua kali di sini.
+    for (var round = 1;
+        round < _maxPushRounds &&
+            (pushed['network_error'] ?? 0) == 0 &&
+            (pushed['sent'] ?? 0) > 0 &&
+            await _queue.hasPending();
+        round++) {
+      pushed = await pushNow();
+    }
+    // Pull hanya bila cloud terjangkau. Item yang DITOLAK cloud bukan alasan
+    // melewatkan pull — dulu satu item macet membuat katalog, pajak & pesanan
+    // online tak pernah ditarik lagi.
+    if ((pushed['network_error'] ?? 0) == 0) {
       await pullUpdates();
       await syncTaxFromCloud();
       // Tarik pesanan mandiri tamu (QR dine-in) menjadi order meja. Menelan
@@ -174,11 +199,11 @@ class CloudSyncService {
     try {
       final outlet = await _outletService.loadOutlet();
       if (!_isConfigured(outlet)) return;
-      final stats = await _queue.stats();
-      final pending = (stats['pending'] ?? 0) + (stats['failed'] ?? 0);
+      final health = await _queue.health();
       final payload = await DeviceHeartbeatService.instance.build(
         online: _consecutiveFails == 0,
-        pendingSync: pending,
+        // Item ditolak tetap dilaporkan agar macetnya terlihat di cloud.
+        pendingSync: health.waiting + health.rejected,
         lastSyncAt: await lastSyncAt(),
       );
       final baseUrl = _normalizeBaseUrl(outlet.cloudApiUrl);
@@ -200,135 +225,212 @@ class CloudSyncService {
 
   // ── Push ──────────────────────────────────────────────────────────────────
 
-  /// Kirim semua item pending. Aman dipanggil manual (tombol "Sync Sekarang").
-  /// Mengembalikan ringkasan {sent, success, failed}.
+  /// Kirim item pending (maks. satu batch). Aman dipanggil manual (tombol
+  /// "Sync Sekarang"). Ringkasan:
+  ///  - sent          : item yang dikirim pada percobaan terakhir
+  ///  - success       : dikonfirmasi tersimpan di cloud
+  ///  - rejected      : sampai di cloud tetapi DITOLAK isinya (perlu perbaikan
+  ///                    data; tidak dianggap offline & tidak memicu backoff)
+  ///  - failed        : gagal jaringan / tak dikonfirmasi — dicoba lagi
+  ///  - network_error : 1 bila cloud tak terjangkau / balasannya tak terbaca
   Future<Map<String, int>> pushNow() async {
-    if (_pushBusy) return {'sent': 0, 'success': 0, 'failed': 0};
+    const idle = {
+      'sent': 0,
+      'success': 0,
+      'rejected': 0,
+      'failed': 0,
+      'network_error': 0,
+    };
+    if (_pushBusy) return {...idle, 'busy': 1};
     _pushBusy = true;
     try {
       final outlet = await _outletService.loadOutlet();
-      if (!_isConfigured(outlet)) {
-        return {'sent': 0, 'success': 0, 'failed': 0, 'unconfigured': 1};
-      }
+      if (!_isConfigured(outlet)) return {...idle, 'unconfigured': 1};
 
-      final rows = await _queue.pending(limit: 200);
-      if (rows.isEmpty) {
-        _consecutiveFails = 0;
-        return {'sent': 0, 'success': 0, 'failed': 0};
-      }
-
-      final items = rows.map((r) {
-        Map<String, dynamic> data;
-        try {
-          data = jsonDecode(r['payload'] as String) as Map<String, dynamic>;
-        } catch (_) {
-          data = {};
+      for (var attempt = 1;; attempt++) {
+        final rows = await _queue.pending(limit: _batchLimit);
+        if (rows.isEmpty) {
+          _consecutiveFails = 0;
+          return idle;
         }
-        return {
-          'entity_type': r['entity_type'],
-          'operation': r['operation'],
-          'data': data,
-        };
-      }).toList();
-
-      final baseUrl = _normalizeBaseUrl(outlet.cloudApiUrl);
-      final url = '$baseUrl/api/v1/outlets/${outlet.cloudOutletId}/sync/batch';
-
-      final body = {
-        'outlet_id': outlet.cloudOutletId,
-        'outlet_code': outlet.code,
-        'sync_timestamp': DateTime.now().toUtc().toIso8601String(),
-        'items': items,
-      };
-
-      try {
-        final resp = await _dio.post(
-          url,
-          data: body,
-          options: Options(headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer ${outlet.cloudApiKey}',
-            'X-Outlet-ID': outlet.cloudOutletId,
-            'X-Outlet-Code': outlet.code,
-          }),
-        );
-
-        // PENANDAAN BERBASIS KONFIRMASI PER-ITEM (whitelist).
-        //
-        // Kontrak cloud: `success:true` di level atas HARDCODED — cloud selalu
-        // balas 200 + success:true asalkan request valid, MESKI ada item yang
-        // gagal tersimpan. Keandalan sebenarnya ada di `data.results[]`:
-        // tiap item sukses punya {entity_type, local_id, status:"success"};
-        // event audit juga memiliki event_id agar dua aksi pada item yang
-        // sama tidak saling mengonfirmasi.
-        //
-        // Maka: tandai "synced" HANYA untuk satu entri yang dapat dicocokkan
-        // tanpa ambigu dengan status=="success". Item gagal/tidak muncul di
-        // results[] harus TETAP di outbox & di-retry (jangan pernah andalkan
-        // success:true level atas → kalau tidak, transaksi gagal tersimpan di
-        // cloud akan ditandai terkirim di tablet dan HILANG permanen).
-        final root = resp.data;
-        final dataPart = root is Map ? root['data'] : null;
-        final results = dataPart is Map ? dataPart['results'] : null;
-
-        // Tanpa results[] yang valid, respons TIDAK bisa dipercaya (success:true
-        // level atas bukan sinyal). Perlakukan seluruh batch sebagai gagal →
-        // tetap pending untuk dicoba lagi.
-        if (results is! List) {
+        try {
+          return await _sendBatch(outlet, rows);
+        } on DioException catch (e) {
+          // Balasan cloud bisa hilang di jalan SETELAH cloud menyimpan batch
+          // (timeout menunggu balasan, koneksi putus, 5xx dari proxy). Kirim
+          // ulang SEKALI: cloud menyimpan per local_id/event_id sehingga aman
+          // diulang, dan konfirmasi yang hilang didapat saat itu juga — tanpa
+          // ini kasir melihat "gagal" padahal data sudah masuk cloud.
+          if (attempt == 1 && _replyMayHaveBeenLost(e)) {
+            debugPrint('CloudSync: balasan cloud hilang '
+                '(${_errMessage(e)}) — kirim ulang sekali');
+            await Future.delayed(_resendDelay);
+            continue;
+          }
+          // Gagal jaringan → tetap pending, naikkan backoff.
           _consecutiveFails++;
           for (final r in rows) {
             await _queue.markFailed(
               r['id'] as int,
-              'Respons cloud tanpa data.results[] — tak bisa konfirmasi per-item',
+              _errMessage(e),
               r['retry_count'] as int,
               r['max_retries'] as int,
             );
           }
-          return {'sent': rows.length, 'success': 0, 'failed': rows.length};
+          return {
+            ...idle,
+            'sent': rows.length,
+            'failed': rows.length,
+            'network_error': 1,
+          };
         }
-
-        final confirmedIds = confirmedSyncQueueIds(rows, results);
-
-        var success = 0;
-        var failed = 0;
-        for (final r in rows) {
-          final id = r['id'] as int;
-          final retry = r['retry_count'] as int;
-          final maxRetries = r['max_retries'] as int;
-          if (confirmedIds.contains(id)) {
-            await _queue.markSuccess(id);
-            success++;
-          } else {
-            // status "failed" atau tak dikonfirmasi cloud → tetap di outbox.
-            await _queue.markFailed(
-                id,
-                'Belum dikonfirmasi cloud (results status ≠ success)',
-                retry,
-                maxRetries);
-            failed++;
-          }
-        }
-        _consecutiveFails = failed > 0 ? _consecutiveFails + 1 : 0;
-        return {'sent': rows.length, 'success': success, 'failed': failed};
-      } on DioException catch (e) {
-        // Gagal jaringan → biarkan tetap pending, naikkan backoff
-        _consecutiveFails++;
-        for (final r in rows) {
-          await _queue.markFailed(
-            r['id'] as int,
-            _errMessage(e),
-            r['retry_count'] as int,
-            r['max_retries'] as int,
-          );
-        }
-        return {'sent': rows.length, 'success': 0, 'failed': rows.length};
       }
     } catch (e) {
       debugPrint('CloudSync pushNow error: $e');
-      return {'sent': 0, 'success': 0, 'failed': 0};
+      return idle;
     } finally {
       _pushBusy = false;
     }
+  }
+
+  /// Jeda sebelum kirim ulang setelah balasan hilang. Dapat diperkecil di tes.
+  @visibleForTesting
+  static Duration resendDelayForTest = const Duration(seconds: 1);
+  Duration get _resendDelay => resendDelayForTest;
+
+  /// Permintaan mungkin sudah diproses cloud walau balasannya tak sampai.
+  /// Gagal TERHUBUNG (connectTimeout), 4xx, sertifikat, atau dibatalkan →
+  /// jelas belum diproses / mengulang tak ada gunanya.
+  static bool _replyMayHaveBeenLost(DioException e) {
+    switch (e.type) {
+      case DioExceptionType.receiveTimeout:
+      case DioExceptionType.sendTimeout:
+      case DioExceptionType.connectionError:
+      case DioExceptionType.unknown:
+        return true;
+      case DioExceptionType.badResponse:
+        return (e.response?.statusCode ?? 0) >= 500;
+      case DioExceptionType.connectionTimeout:
+      case DioExceptionType.badCertificate:
+      case DioExceptionType.cancel:
+        return false;
+    }
+  }
+
+  /// Kirim satu batch & tandai tiap baris outbox sesuai jawaban cloud.
+  /// Melempar [DioException] bila permintaan/balasan gagal di jaringan.
+  Future<Map<String, int>> _sendBatch(
+      OutletInfo outlet, List<Map<String, dynamic>> rows) async {
+    final items = rows.map((r) {
+      Map<String, dynamic> data;
+      try {
+        data = jsonDecode(r['payload'] as String) as Map<String, dynamic>;
+      } catch (_) {
+        data = {};
+      }
+      return {
+        'entity_type': r['entity_type'],
+        'operation': r['operation'],
+        'data': data,
+      };
+    }).toList();
+
+    final baseUrl = _normalizeBaseUrl(outlet.cloudApiUrl);
+    final url = '$baseUrl/api/v1/outlets/${outlet.cloudOutletId}/sync/batch';
+
+    final body = {
+      'outlet_id': outlet.cloudOutletId,
+      'outlet_code': outlet.code,
+      'sync_timestamp': DateTime.now().toUtc().toIso8601String(),
+      'items': items,
+    };
+
+    final resp = await _dio.post(
+      url,
+      data: body,
+      options: Options(headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ${outlet.cloudApiKey}',
+        'X-Outlet-ID': outlet.cloudOutletId,
+        'X-Outlet-Code': outlet.code,
+      }),
+    );
+
+    // PENANDAAN BERBASIS KONFIRMASI PER-ITEM (whitelist).
+    //
+    // Kontrak cloud: `success:true` di level atas HARDCODED — cloud selalu
+    // balas 200 + success:true asalkan request valid, MESKI ada item yang
+    // gagal tersimpan. Keandalan sebenarnya ada di `data.results[]`:
+    // tiap item sukses punya {entity_type, local_id, status:"success"};
+    // event audit juga memiliki event_id agar dua aksi pada item yang
+    // sama tidak saling mengonfirmasi.
+    //
+    // Maka: tandai "synced" HANYA untuk satu entri yang dapat dicocokkan
+    // tanpa ambigu dengan status=="success". Item gagal/tidak muncul di
+    // results[] harus TETAP di outbox & di-retry (jangan pernah andalkan
+    // success:true level atas → kalau tidak, transaksi gagal tersimpan di
+    // cloud akan ditandai terkirim di tablet dan HILANG permanen).
+    final root = resp.data;
+    final dataPart = root is Map ? root['data'] : null;
+    final results = dataPart is Map ? dataPart['results'] : null;
+
+    // Tanpa results[] yang valid, respons TIDAK bisa dipercaya (success:true
+    // level atas bukan sinyal; mis. halaman login Wi-Fi yang membalas 200).
+    // Perlakukan seperti gagal jaringan → tetap pending untuk dicoba lagi.
+    if (results is! List) {
+      _consecutiveFails++;
+      for (final r in rows) {
+        await _queue.markFailed(
+          r['id'] as int,
+          'Respons cloud tanpa data.results[] — tak bisa konfirmasi per-item',
+          r['retry_count'] as int,
+          r['max_retries'] as int,
+        );
+      }
+      return {
+        'sent': rows.length,
+        'success': 0,
+        'rejected': 0,
+        'failed': rows.length,
+        'network_error': 1,
+      };
+    }
+
+    final confirmedIds = confirmedSyncQueueIds(rows, results);
+    final rejectedErrors = rejectedSyncQueueErrors(rows, results);
+
+    var success = 0;
+    var rejected = 0;
+    var unconfirmed = 0;
+    for (final r in rows) {
+      final id = r['id'] as int;
+      final retry = r['retry_count'] as int;
+      if (confirmedIds.contains(id)) {
+        await _queue.markSuccess(id);
+        success++;
+      } else if (rejectedErrors.containsKey(id)) {
+        // Cloud menolak isinya (mis. produk tak cocok). Tetap di outbox &
+        // dikirim ulang tiap siklus, tapi tidak membuat tablet "offline".
+        await _queue.markNotAccepted(
+            id, 'Ditolak cloud: ${rejectedErrors[id]}', retry,
+            kind: SyncQueueRepository.errorKindRejected);
+        rejected++;
+      } else {
+        await _queue.markNotAccepted(
+            id, 'Belum dikonfirmasi cloud — dikirim ulang otomatis', retry,
+            kind: SyncQueueRepository.errorKindUnconfirmed);
+        unconfirmed++;
+      }
+    }
+    // Cloud terjangkau & menjawab per item → koneksi sehat.
+    _consecutiveFails = 0;
+    return {
+      'sent': rows.length,
+      'success': success,
+      'rejected': rejected,
+      'failed': unconfirmed,
+      'network_error': 0,
+    };
   }
 
   // ── Pull (master data dari cloud) ───────────────────────────────────────────

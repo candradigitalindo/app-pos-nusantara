@@ -1,6 +1,9 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'app.dart';
+import 'services/app_update_service.dart';
 import 'services/device_role_service.dart';
 import 'services/logo_service.dart';
 
@@ -16,6 +19,11 @@ void main() async {
   if (role == DeviceRole.mainPos) {
     await DeviceRoleService.instance.startMainPosServices();
   }
+
+  // Pembaruan dalam-aplikasi untuk SEMUA peran (station juga): cek APK POS
+  // terbaru di cloud, unduh di latar belakang, tawarkan "Pasang". Tidak
+  // menahan startup.
+  unawaited(AppUpdateService.instance.start());
 
   // Hide system UI (status bar + navigation bar) — immersive sticky mode
   // System UI will temporarily appear on edge swipe, then auto-hide again

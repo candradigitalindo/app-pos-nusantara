@@ -14,6 +14,13 @@
     <!-- Location untuk BT scan di Android < 12 -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
 
+    <!-- Pembaruan dalam-aplikasi: APK versi baru diunduh dari cloud lalu
+         dipasang lewat PackageInstaller. Pengguna mengizinkan "Instal aplikasi
+         tak dikenal" sekali per tablet; Android 12+ boleh memasang pembaruan
+         dirinya sendiri tanpa ketukan bila syarat sistem terpenuhi. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+    <uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION"/>
+
     <application
         android:label="pos_resto"
         android:name="${applicationName}"

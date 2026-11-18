@@ -82,6 +82,15 @@ murni telemetri, tidak di-retry.
 }
 ```
 
+Arti `network` (sejak DB v17 / Nov 2026):
+
+- `online` — cloud **terjangkau** pada percobaan kirim terakhir. Item yang
+  sampai ke cloud tetapi ditolak isinya (mis. produk tak cocok) **tidak**
+  membuatnya `false`; dulu satu item macet membuat tablet terus melapor
+  offline dan menunda sinkron hingga 30 menit.
+- `pending_sync` — item outbox yang belum dikonfirmasi cloud **ditambah** item
+  yang ditolak cloud, supaya item macet tetap terlihat dari cloud.
+
 ---
 
 ## 3. Field baru — CPU & RAM

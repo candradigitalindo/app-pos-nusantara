@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:sqflite/sqflite.dart';
 
 import '../database/database.dart';
@@ -347,6 +349,79 @@ class CashierRepository {
     );
     if (results.isEmpty) return null;
     return CashierShift.fromMap(results.first);
+  }
+
+  Future<CashierShift?> getShiftById(String id) => _getShiftById(id);
+
+  Future<Map<String, dynamic>?> _storedClosingReport(
+      String shiftId, DatabaseExecutor db) async {
+    final rows = await db.query('cashier_shifts',
+        columns: ['closing_report'], where: 'id = ?', whereArgs: [shiftId]);
+    final raw = rows.isEmpty ? null : rows.first['closing_report'] as String?;
+    if (raw == null || raw.isEmpty) return null;
+    try {
+      final decoded = jsonDecode(raw);
+      return decoded is Map<String, dynamic> ? decoded : null;
+    } catch (_) {
+      return null; // snapshot rusak → hitung ulang, jangan gagal mencetak
+    }
+  }
+
+  /// Laporan tutup kasir untuk dicetak (pertama kali maupun cetak ulang).
+  /// [frozen] = snapshot saat penutupan — identik dengan yang dikirim ke cloud.
+  /// Shift yang ditutup oleh versi lama belum punya snapshot: laporannya
+  /// dihitung ulang dari data tablet ([frozen] = false) dan struk menandainya.
+  Future<({Map<String, dynamic> report, bool frozen})> getClosingReport(
+      String shiftId) async {
+    final db = await _db.database;
+    final shift = await _getShiftById(shiftId, executor: db);
+    if (shift == null) throw Exception('Shift tidak ditemukan');
+    if (shift.isOpen) throw Exception('Shift belum ditutup');
+    final frozen = await _storedClosingReport(shiftId, db);
+    if (frozen != null) return (report: frozen, frozen: true);
+    return (report: await getShiftReport(shiftId, executor: db), frozen: false);
+  }
+
+  /// Shift yang sudah ditutup (terbaru dulu) untuk daftar cetak ulang laporan
+  /// tutup kasir, beserta ringkasan dari snapshot bila ada.
+  Future<
+      List<
+          ({
+            CashierShift shift,
+            double? salesTotal,
+            int? salesCount,
+            bool frozen
+          })>> getRecentClosedShifts({int limit = 30}) async {
+    final db = await _db.database;
+    final rows = await db.query(
+      'cashier_shifts',
+      where: "status = 'closed' AND closed_at IS NOT NULL",
+      orderBy: 'closed_at DESC',
+      limit: limit,
+    );
+    final out = <({
+      CashierShift shift,
+      double? salesTotal,
+      int? salesCount,
+      bool frozen
+    })>[];
+    for (final row in rows) {
+      Map<String, dynamic>? report;
+      final raw = row['closing_report'] as String?;
+      if (raw != null && raw.isNotEmpty) {
+        try {
+          final decoded = jsonDecode(raw);
+          if (decoded is Map<String, dynamic>) report = decoded;
+        } catch (_) {}
+      }
+      out.add((
+        shift: CashierShift.fromMap(row),
+        salesTotal: (report?['sales_total'] as num?)?.toDouble(),
+        salesCount: (report?['sales_count'] as num?)?.toInt(),
+        frozen: report != null,
+      ));
+    }
+    return out;
   }
 
   Future<CashierShift> _requireOpenShift(String id,
@@ -709,7 +784,22 @@ class CashierRepository {
   /// dikirim agar cloud bisa simpan; `report` membawa rincian count.
   Future<void> _enqueueShift(CashierShift shift, String operation,
       {DatabaseExecutor? executor}) async {
-    final report = await getShiftReport(shift.id, executor: executor);
+    final db = executor ?? await _db.database;
+    Map<String, dynamic> report;
+    if (shift.status == 'closed') {
+      // Laporan tutup kasir DIBEKUKAN sekali, di transaksi penutupan yang sama
+      // dengan payload cloud ini. Cetak pertama, cetak ulang, dan cloud memakai
+      // angka & daftar menu yang identik — void/retensi data sesudahnya tidak
+      // bisa mengubah laporan shift yang sudah ditutup.
+      final frozen = await _storedClosingReport(shift.id, db);
+      report = frozen ?? await getShiftReport(shift.id, executor: db);
+      if (frozen == null) {
+        await db.update('cashier_shifts', {'closing_report': jsonEncode(report)},
+            where: 'id = ?', whereArgs: [shift.id]);
+      }
+    } else {
+      report = await getShiftReport(shift.id, executor: db);
+    }
     await _sync.enqueue(
       entityType: 'cashier_shift',
       entityId: shift.id,

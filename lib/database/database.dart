@@ -32,7 +32,7 @@ class AppDatabase {
 
     return openDatabase(
       path,
-      version: 16,
+      version: 17,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
       onConfigure: _onConfigure,
@@ -193,7 +193,70 @@ class AppDatabase {
         'CREATE INDEX IF NOT EXISTS idx_transactions_order_date ON transactions(order_id, transaction_date)',
       );
     }
+    if (oldVersion < 17) {
+      // sync_queue.error_kind — jenis kegagalan terakhir: 'network' (cloud tak
+      // terjangkau / balasan hilang), 'rejected' (cloud menolak isi datanya),
+      // 'unconfirmed' (balasan tanpa konfirmasi item). Indikator kasir hanya
+      // menyebut "offline" untuk kegagalan jaringan.
+      // cashier_shifts.closing_report — laporan tutup kasir yang dibekukan saat
+      // shift ditutup (JSON, sama persis dengan yang dikirim ke cloud), sumber
+      // cetak ulang. Shift lama tanpa snapshot dihitung ulang dari data tablet.
+      // CREATE IF NOT EXISTS dulu: tabel yang belum ada langsung lengkap,
+      // tabel yang sudah ada hanya ditambah kolom yang kurang.
+      await db.execute(_cashierShiftsSql);
+      await db.execute(_syncQueueSql);
+      await _addColumnIfMissing(db, 'sync_queue', 'error_kind', 'TEXT');
+      await _addColumnIfMissing(db, 'cashier_shifts', 'closing_report', 'TEXT');
+    }
   }
+
+  static Future<void> _addColumnIfMissing(
+      Database db, String table, String column, String definition) async {
+    final columns = await db.rawQuery('PRAGMA table_info($table)');
+    if (columns.any((c) => c['name'] == column)) return;
+    await db.execute('ALTER TABLE $table ADD COLUMN $column $definition');
+  }
+
+  static const String _cashierShiftsSql = '''
+    CREATE TABLE IF NOT EXISTS cashier_shifts (
+      id TEXT PRIMARY KEY,
+      opened_by TEXT NOT NULL,
+      opened_at DATETIME NOT NULL,
+      opening_cash REAL NOT NULL DEFAULT 0,
+      closed_at DATETIME,
+      closed_by TEXT,
+      closing_cash REAL,
+      closing_card REAL,
+      closing_qris REAL,
+      closing_transfer REAL,
+      carry_over_cash REAL,
+      previous_shift_id TEXT,
+      handover_to TEXT,
+      status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
+      notes TEXT,
+      closing_report TEXT,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  ''';
+
+  static const String _syncQueueSql = '''
+    CREATE TABLE IF NOT EXISTS sync_queue (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_type TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      operation TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'success', 'failed', 'bundled')),
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      max_retries INTEGER NOT NULL DEFAULT 3,
+      error_message TEXT,
+      error_kind TEXT,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      processed_at DATETIME,
+      synced_at DATETIME
+    )
+  ''';
 
   // Add-on/modifier per produk. Harga add-on DILIPAT ke harga item saat
   // pesanan dibuat (lihat OrderRepository), sehingga subtotal, pajak, dan
@@ -536,27 +599,7 @@ class AppDatabase {
     ''');
 
     // Cashier Shifts
-    await db.execute('''
-      CREATE TABLE IF NOT EXISTS cashier_shifts (
-        id TEXT PRIMARY KEY,
-        opened_by TEXT NOT NULL,
-        opened_at DATETIME NOT NULL,
-        opening_cash REAL NOT NULL DEFAULT 0,
-        closed_at DATETIME,
-        closed_by TEXT,
-        closing_cash REAL,
-        closing_card REAL,
-        closing_qris REAL,
-        closing_transfer REAL,
-        carry_over_cash REAL,
-        previous_shift_id TEXT,
-        handover_to TEXT,
-        status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
-        notes TEXT,
-        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-      )
-    ''');
+    await db.execute(_cashierShiftsSql);
 
     // Cashier Cash Movements
     await db.execute('''
@@ -572,22 +615,7 @@ class AppDatabase {
     ''');
 
     // Sync Queue
-    await db.execute('''
-      CREATE TABLE IF NOT EXISTS sync_queue (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        entity_type TEXT NOT NULL,
-        entity_id TEXT NOT NULL,
-        operation TEXT NOT NULL,
-        payload TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'success', 'failed', 'bundled')),
-        retry_count INTEGER NOT NULL DEFAULT 0,
-        max_retries INTEGER NOT NULL DEFAULT 3,
-        error_message TEXT,
-        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        processed_at DATETIME,
-        synced_at DATETIME
-      )
-    ''');
+    await db.execute(_syncQueueSql);
 
     // Sync Logs
     await db.execute('''

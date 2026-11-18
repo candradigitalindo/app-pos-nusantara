@@ -216,6 +216,8 @@ class ReceiptBuilder {
     DateTime? closedAt,
     String? handoverToName,
     double? countedCash,
+    DateTime? reprintedAt,
+    bool recomputed = false,
   }) {
     final buf = <int>[];
     buf.addAll(_Esc.init());
@@ -227,6 +229,8 @@ class ReceiptBuilder {
     buf.addAll(_Esc.line(outletName));
     buf.addAll(_Esc.size(0, 0));
     buf.addAll(_Esc.line(title));
+    // Salinan harus tak bisa dikira cetakan asli.
+    if (reprintedAt != null) buf.addAll(_Esc.line('*** CETAK ULANG ***'));
     buf.addAll(_Esc.boldOff());
     buf.addAll(_Esc.leftAlign());
     buf.addAll(_Esc.line(_divider()));
@@ -238,6 +242,14 @@ class ReceiptBuilder {
         _Esc.line('Tutup : ${_formatDateTime(closedAt ?? DateTime.now())}'));
     if (handoverToName != null && handoverToName.isNotEmpty) {
       buf.addAll(_Esc.line('Serah ke: $handoverToName'));
+    }
+    if (reprintedAt != null) {
+      buf.addAll(_Esc.line('Dicetak: ${_formatDateTime(reprintedAt)}'));
+    }
+    if (recomputed) {
+      // Shift ditutup versi lama (tanpa snapshot): angka dihitung ulang dari
+      // data yang masih ada di tablet, bisa berbeda dari cetakan asli.
+      buf.addAll(_Esc.line('Dihitung ulang dari data tablet'));
     }
     buf.addAll(_Esc.line(_divider()));
 

@@ -1,4 +1,4 @@
-// Verifikasi migrasi DB v10 → v16 terhadap SQLITE ASLI berisi data.
+// Verifikasi migrasi DB v10 → v17 terhadap SQLITE ASLI berisi data.
 //
 // Migrasi-migrasi ini menyentuh tabel yang sudah dipakai di lapangan:
 //
@@ -48,9 +48,19 @@ void main() {
     await testDirectory.delete(recursive: true);
   });
 
-  test('versi skema naik ke 16', () async {
+  test('versi skema naik ke 17', () async {
     final versi = (await db.rawQuery('PRAGMA user_version')).first.values.first;
-    expect(versi, 16);
+    expect(versi, 17);
+  });
+
+  test('migrasi v17 melengkapi outbox & shift walau tabelnya belum ada',
+      () async {
+    Future<Set<Object?>> columns(String table) async =>
+        (await db.rawQuery('PRAGMA table_info($table)'))
+            .map((c) => c['name'])
+            .toSet();
+    expect(await columns('sync_queue'), contains('error_kind'));
+    expect(await columns('cashier_shifts'), contains('closing_report'));
   });
 
   test('migrasi v16 menjaga data dan jenis item historis tetap tidak diketahui',

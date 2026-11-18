@@ -69,6 +69,8 @@ class SyncQueueRepository {
       'sync_queue',
       {
         'status': 'success',
+        'error_message': null,
+        'error_kind': null,
         'processed_at': DateTime.now().toIso8601String(),
         'synced_at': DateTime.now().toIso8601String(),
       },
@@ -77,8 +79,11 @@ class SyncQueueRepository {
     );
   }
 
+  /// Kegagalan JARINGAN (cloud tak terjangkau / balasan hilang): tetap
+  /// pending untuk dicoba lagi sampai [maxRetries], lalu 'failed'.
   Future<void> markFailed(
-      int id, String error, int retryCount, int maxRetries) async {
+      int id, String error, int retryCount, int maxRetries,
+      {String kind = errorKindNetwork}) async {
     final db = await _db.database;
     final exhausted = retryCount + 1 >= maxRetries;
     await db.update(
@@ -87,12 +92,39 @@ class SyncQueueRepository {
         'status': exhausted ? 'failed' : 'pending',
         'retry_count': retryCount + 1,
         'error_message': error,
+        'error_kind': kind,
         'processed_at': DateTime.now().toIso8601String(),
       },
       where: 'id = ?',
       whereArgs: [id],
     );
   }
+
+  /// Cloud MENERIMA permintaan tetapi tidak menyimpan item ini — ditolak
+  /// dengan alasan ([kind] = [errorKindRejected]) atau tidak dikonfirmasi
+  /// sama sekali ([errorKindUnconfirmed]). Langsung 'failed' agar tidak dikirim
+  /// berulang dalam siklus yang sama; [retryFailed] di awal siklus berikutnya
+  /// mengirimnya lagi, sehingga item pulih sendiri begitu data cloud dibetulkan.
+  Future<void> markNotAccepted(int id, String error, int retryCount,
+      {String kind = errorKindRejected}) async {
+    final db = await _db.database;
+    await db.update(
+      'sync_queue',
+      {
+        'status': 'failed',
+        'retry_count': retryCount + 1,
+        'error_message': error,
+        'error_kind': kind,
+        'processed_at': DateTime.now().toIso8601String(),
+      },
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+
+  static const errorKindNetwork = 'network';
+  static const errorKindRejected = 'rejected';
+  static const errorKindUnconfirmed = 'unconfirmed';
 
   Future<Map<String, int>> stats() async {
     final db = await _db.database;
@@ -104,6 +136,34 @@ class SyncQueueRepository {
       out[r['status'] as String] = r['c'] as int;
     }
     return out;
+  }
+
+  /// Ringkasan outbox untuk indikator kasir:
+  ///  - [waiting]  : belum terkonfirmasi cloud (antre / gagal jaringan)
+  ///  - [rejected] : ditolak cloud — terkirim, tapi isinya perlu dibetulkan
+  ///                 (mis. produk tak cocok); BUKAN tanda tablet offline.
+  Future<({int waiting, int rejected})> health() async {
+    final db = await _db.database;
+    final rows = await db.rawQuery('''
+      SELECT
+        COALESCE(SUM(CASE WHEN error_kind = '$errorKindRejected' THEN 0 ELSE 1 END), 0) AS waiting,
+        COALESCE(SUM(CASE WHEN error_kind = '$errorKindRejected' THEN 1 ELSE 0 END), 0) AS rejected
+      FROM sync_queue
+      WHERE status IN ('pending', 'processing', 'bundled', 'failed')
+    ''');
+    final row = rows.first;
+    return (
+      waiting: (row['waiting'] as num?)?.toInt() ?? 0,
+      rejected: (row['rejected'] as num?)?.toInt() ?? 0,
+    );
+  }
+
+  /// Masih ada item pending (siap dikirim) di outbox?
+  Future<bool> hasPending() async {
+    final db = await _db.database;
+    final rows = await db.rawQuery(
+        "SELECT 1 FROM sync_queue WHERE status = 'pending' LIMIT 1");
+    return rows.isNotEmpty;
   }
 
   /// Rekonsiliasi lokal: bandingkan transaksi (uang) vs status sinkronisasinya.
@@ -191,6 +251,7 @@ class SyncQueueRepository {
         'status',
         'retry_count',
         'error_message',
+        'error_kind',
         'created_at',
       ],
       orderBy: 'created_at DESC',
@@ -204,12 +265,14 @@ class SyncQueueRepository {
     return db.delete('sync_queue', where: "status = 'success'");
   }
 
-  /// Reset semua job gagal agar dicoba lagi.
+  /// Reset semua job gagal agar dicoba lagi. Alasan & jenis kegagalan terakhir
+  /// dipertahankan sampai cloud menjawab lagi, supaya item yang ditolak tetap
+  /// terbaca "ditolak" (bukan "offline") selama dikirim ulang.
   Future<void> retryFailed() async {
     final db = await _db.database;
     await db.update(
       'sync_queue',
-      {'status': 'pending', 'retry_count': 0, 'error_message': null},
+      {'status': 'pending', 'retry_count': 0},
       where: "status = 'failed'",
     );
   }

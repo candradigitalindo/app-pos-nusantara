@@ -14,6 +14,7 @@ import '../../services/device_role_service.dart';
 import '../../services/logo_service.dart';
 import '../../services/outlet_service.dart';
 import '../../theme/theme.dart';
+import '../../widgets/app_update_banner.dart';
 import '../../widgets/ui/ui.dart';
 import 'print_queue_screen.dart';
 import 'user_management_screen.dart';
@@ -869,7 +870,20 @@ class _SettingsScreenState extends State<SettingsScreen>
   Widget _tabAplikasi() {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(AppSpacing.lg),
-      child: _group([
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // Versi terpasang + periksa/pasang pembaruan dari cloud.
+          const AppUpdateCard(),
+          const SizedBox(height: AppSpacing.md),
+          _tabAplikasiMenu(),
+        ],
+      ),
+    );
+  }
+
+  Widget _tabAplikasiMenu() {
+    return _group([
         _settingRow(
           Icons.print_rounded,
           'Pengaturan Printer',
@@ -917,8 +931,7 @@ class _SettingsScreenState extends State<SettingsScreen>
           'Versi Aplikasi',
           _appVersion,
         ),
-      ]),
-    );
+      ]);
   }
 
   Future<void> _changeDeviceRole() async {

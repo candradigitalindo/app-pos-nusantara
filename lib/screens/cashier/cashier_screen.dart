@@ -11,9 +11,11 @@ import '../../services/cash_drawer_service.dart';
 import '../../services/cloud_sync_service.dart';
 import '../../services/qris_service.dart';
 import '../../services/reservation_service.dart';
+import '../../services/sync_feedback.dart';
 import '../../theme/theme.dart';
 import '../../utils/currency.dart';
 import '../../widgets/addon_picker_dialog.dart';
+import '../../widgets/app_update_banner.dart';
 import '../../widgets/pax_input_dialog.dart';
 import '../../widgets/pin_auth_dialog.dart';
 import '../../widgets/qris_payment_dialog.dart';
@@ -22,6 +24,7 @@ import '../../widgets/ui/ui.dart';
 import 'cashier_order_actions.dart';
 import 'cashier_widgets.dart';
 import 'shift_period_summary.dart';
+import 'shift_reprint_dialogs.dart';
 
 class CashierScreen extends StatefulWidget {
   final String? initialTableNumber;
@@ -42,8 +45,7 @@ class _CashierScreenState extends State<CashierScreen>
   // Status sinkronisasi (indikator offline / menunggu sync) di header.
   // ValueNotifier agar update 8-detik HANYA me-rebuild pil, bukan seluruh layar
   // (penting untuk tablet spek rendah).
-  final ValueNotifier<({bool enabled, int pending, bool online})?> _sync =
-      ValueNotifier(null);
+  final ValueNotifier<SyncIndicator?> _sync = ValueNotifier(null);
   Timer? _syncTimer;
 
   // Aksi sekunder keranjang (Diskon/Split/Pindah/dll) disembunyikan default agar
@@ -496,7 +498,14 @@ class _CashierScreenState extends State<CashierScreen>
                   padding: const EdgeInsets.all(AppSpacing.xl),
                   child: ConstrainedBox(
                     constraints: const BoxConstraints(maxWidth: 420),
-                    child: AppCard(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                    // Waktu paling aman memasang pembaruan: kasir sudah tutup.
+                    const AppUpdateBanner(
+                        padding: EdgeInsets.only(bottom: AppSpacing.lg)),
+                    AppCard(
                       padding: const EdgeInsets.all(AppSpacing.xxl),
                       radius: AppRadius.rXxl,
                       child: Column(
@@ -577,8 +586,20 @@ class _CashierScreenState extends State<CashierScreen>
                               );
                             },
                           ),
+                          const SizedBox(height: AppSpacing.sm),
+                          // Sesudah tutup kasir: salinan laporan shift yang
+                          // sudah ditutup (isi identik dengan cetakan asli).
+                          AppButton(
+                            key: const Key('gate-reprint-shift-report'),
+                            label: 'Cetak Ulang Laporan Tutup Kasir',
+                            icon: Icons.print_outlined,
+                            variant: AppButtonVariant.neutral,
+                            onPressed: _showClosedShiftPicker,
+                          ),
                         ],
                       ),
+                    ),
+                      ],
                     ),
                   ),
                 ),
@@ -632,7 +653,7 @@ class _CashierScreenState extends State<CashierScreen>
     }
 
     if (!mounted) return;
-    showDialog(
+    final closed = await showDialog<bool>(
       context: context,
       barrierDismissible: false,
       builder: (ctx) => CloseShiftDialog(
@@ -642,6 +663,63 @@ class _CashierScreenState extends State<CashierScreen>
         onClose: () => _controller.closeShift(shiftId: shift.id),
       ),
     );
+    if (closed != true || !mounted) return;
+    // Laporan sudah otomatis masuk antrean cetak. Beri jalan cetak ulang di
+    // tempat — mis. kertas habis, struk rusak, atau perlu salinan untuk owner.
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => ShiftClosedDialog(
+        onReprint: () => _controller.reprintShiftReport(shift.id),
+      ),
+    );
+  }
+
+  /// Daftar shift yang sudah ditutup → pilih untuk cetak ulang laporannya.
+  Future<void> _showClosedShiftPicker() async {
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => ClosedShiftReprintDialog(
+        loadShifts: _controller.getRecentClosedShifts,
+        onReprint: _controller.reprintShiftReport,
+      ),
+    );
+  }
+
+  /// Tombol "Cetak Ulang" di header: struk transaksi atau laporan tutup kasir.
+  Future<void> _showReprintMenu() async {
+    final choice = await showAppModal<String>(
+      context,
+      title: 'Cetak Ulang',
+      icon: Icons.print_outlined,
+      accent: AppColors.moduleKasir,
+      scrollable: false,
+      maxWidth: 440,
+      builder: (ctx) => Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          AppButton(
+            key: const Key('reprint-receipt'),
+            label: 'Struk Transaksi',
+            icon: Icons.receipt_long_outlined,
+            accent: AppColors.moduleKasir,
+            onPressed: () => Navigator.of(ctx).pop('receipt'),
+          ),
+          const SizedBox(height: AppSpacing.sm),
+          AppButton(
+            key: const Key('reprint-shift-report'),
+            label: 'Laporan Tutup Kasir',
+            icon: Icons.summarize_outlined,
+            variant: AppButtonVariant.tonal,
+            accent: AppColors.moduleKasir,
+            onPressed: () => Navigator.of(ctx).pop('shift'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted) return;
+    if (choice == 'receipt') _showReprintPicker();
+    if (choice == 'shift') await _showClosedShiftPicker();
   }
 
   // Satu container group dengan border
@@ -736,7 +814,7 @@ class _CashierScreenState extends State<CashierScreen>
         _headerBtn(
             icon: Icons.print_outlined,
             label: 'Cetak Ulang',
-            onTap: _showReprintPicker,
+            onTap: _showReprintMenu,
             width: w),
         _groupDivider(),
         CashierHeaderButton(
@@ -817,17 +895,10 @@ class _CashierScreenState extends State<CashierScreen>
       _sync.value = await CloudSyncService.instance.status();
     } catch (_) {}
     if (!mounted) return;
-    final now = _sync.value;
-    final ok = now != null && now.online && now.pending == 0;
-    showAppSnack(
-      context,
-      ok
-          ? 'Tersinkron ke cloud.'
-          : (now != null && !now.online
-              ? 'Offline — data tersimpan, dikirim saat online.'
-              : 'Sinkron: ${now?.pending ?? 0} data masih menunggu.'),
-      isError: !ok,
-    );
+    final result = describeManualSync(_sync.value);
+    showAppSnack(context, result.message,
+        isError: result.tone == SyncTone.error,
+        isWarning: result.tone == SyncTone.warning);
   }
 
   // Separator tipis di dalam group
@@ -1644,7 +1715,7 @@ class _CashierScreenState extends State<CashierScreen>
 // ── Tombol Sinkron header: status + animasi berputar saat proses ──
 class _SyncButton extends StatefulWidget {
   final bool syncing;
-  final ({bool enabled, int pending, bool online})? status;
+  final SyncIndicator? status;
   final VoidCallback onTap;
   final double width;
   final double height;
@@ -1718,6 +1789,12 @@ class _SyncButtonState extends State<_SyncButton>
     } else if (s.pending > 0) {
       icon = Icons.cloud_upload_rounded;
       label = '${s.pending} Antre';
+    } else if (s.rejected > 0) {
+      // Terhubung & data lain sudah masuk; hanya item ini yang ditolak cloud
+      // (perlu perbaikan data). Jangan tampil sebagai "offline"/gagal total.
+      icon = Icons.report_problem_rounded;
+      label = '${s.rejected} Ditolak';
+      color = const Color(0xFFFCD34D);
     } else {
       icon = Icons.cloud_done_rounded;
       label = 'Sinkron';
@@ -3335,7 +3412,9 @@ class _CloseShiftDialogState extends State<CloseShiftDialog> {
                               catch (e) { error = 'Gagal menutup shift: ${e.toString().replaceFirst('Exception: ', '')}'; }
                               if (!mounted) return;
                               if (error == null) {
-                                Navigator.of(this.context).pop();
+                                // true = shift sudah ditutup → pemanggil
+                                // menawarkan cetak ulang laporan.
+                                Navigator.of(this.context).pop(true);
                               } else {
                                 setState(() { _closing = false; _closeError = error; });
                               }

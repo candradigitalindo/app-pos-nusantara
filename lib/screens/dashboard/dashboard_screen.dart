@@ -7,6 +7,7 @@ import '../../models/models.dart';
 import '../../services/app_events.dart';
 import '../../theme/theme.dart';
 import '../../utils/currency.dart';
+import '../../widgets/app_update_banner.dart';
 import '../../widgets/ui/ui.dart';
 import '../cashier/cashier_screen.dart';
 import '../tables/tables_screen.dart';
@@ -253,6 +254,12 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen>
                         child: _WelcomeBar(greeting: _greeting(), user: user, role: role),
                       ),
                     ),
+                    SliverToBoxAdapter(
+                      child: AppUpdateBanner(
+                        padding: EdgeInsets.fromLTRB(
+                            context.pagePadX, AppSpacing.lg, context.pagePadX, 0),
+                      ),
+                    ),
                     if (isAdmin)
                       SliverToBoxAdapter(
                         child: Padding(
@@ -305,6 +312,8 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen>
               child: ListView(
                 padding: EdgeInsets.all(context.pagePadX),
                 children: [
+                  const AppUpdateBanner(
+                      padding: EdgeInsets.only(bottom: AppSpacing.lg)),
                   if (isAdmin) ...[
                     _StatsOverview(state: dashState),
                     const SizedBox(height: AppSpacing.lg),
