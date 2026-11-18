@@ -1049,6 +1049,8 @@ class CashMovement {
   final String counterpartName;
   final String note;
   final DateTime createdAt;
+  // Id tugas cloud "Bayar Pengadaan" (Kas Kasir Outlet); null = kas biasa.
+  final String? cashPayoutId;
 
   const CashMovement({
     required this.id,
@@ -1058,9 +1060,11 @@ class CashMovement {
     required this.counterpartName,
     this.note = '',
     required this.createdAt,
+    this.cashPayoutId,
   });
 
   bool get isCashIn => movementType == 'in';
+  bool get isProcurementPayout => (cashPayoutId ?? '').isNotEmpty;
 
   Map<String, dynamic> toMap() => {
         'id': id,
@@ -1070,6 +1074,7 @@ class CashMovement {
         'counterpart_name': counterpartName,
         'note': note,
         'created_at': createdAt.toIso8601String(),
+        if (cashPayoutId != null) 'cash_payout_id': cashPayoutId,
       };
 
   factory CashMovement.fromMap(Map<String, dynamic> map) => CashMovement(
@@ -1080,5 +1085,6 @@ class CashMovement {
         counterpartName: map['counterpart_name'] as String,
         note: map['note'] as String? ?? '',
         createdAt: DateTime.parse(map['created_at'] as String),
+        cashPayoutId: map['cash_payout_id'] as String?,
       );
 }

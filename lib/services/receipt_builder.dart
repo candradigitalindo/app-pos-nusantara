@@ -646,6 +646,89 @@ class ReceiptBuilder {
     return Uint8List.fromList(buf);
   }
 
+  /// Bukti penyerahan kas "Bayar Pengadaan" (Kas Kasir Outlet). Ditandatangani
+  /// kasir & penerima lalu diserahkan ke Bagian Keuangan sebagai bukti fisik.
+  Uint8List buildCashPayoutProof({
+    required String outletName,
+    required String requestNumber,
+    required String vendorName,
+    required String itemsSummary,
+    required String recipient,
+    required double amount,
+    required DateTime handedAt,
+    required String cashierName,
+    required String authorizedBy,
+    String assignedBy = '',
+    String notes = '',
+    DateTime? reprintedAt,
+  }) {
+    final buf = <int>[];
+    buf.addAll(_Esc.init());
+    buf.addAll(_Esc.centerAlign());
+    buf.addAll(_Esc.boldOn());
+    buf.addAll(_Esc.line(_clean(outletName)));
+    buf.addAll(_Esc.line('BUKTI PENYERAHAN KAS'));
+    buf.addAll(_Esc.boldOff());
+    buf.addAll(_Esc.line('Pembayaran Pengadaan'));
+    if (reprintedAt != null) {
+      buf.addAll(_Esc.boldOn());
+      buf.addAll(_Esc.line('*** CETAK ULANG ***'));
+      buf.addAll(_Esc.boldOff());
+    }
+    buf.addAll(_Esc.leftAlign());
+    buf.addAll(_Esc.line(_divider()));
+    _labeled(buf, 'No. Pengajuan', requestNumber);
+    if (vendorName.trim().isNotEmpty) _labeled(buf, 'Vendor', vendorName);
+    if (itemsSummary.trim().isNotEmpty) _labeled(buf, 'Keperluan', itemsSummary);
+    _labeled(buf, 'Diterima oleh', recipient);
+    buf.addAll(_Esc.line(_divider()));
+    buf.addAll(_Esc.boldOn());
+    buf.addAll(_Esc.size(0, 1));
+    buf.addAll(_Esc.line(_rightAlign('JUMLAH', 'Rp ${_formatAmount(amount)}')));
+    buf.addAll(_Esc.size(0, 0));
+    buf.addAll(_Esc.boldOff());
+    buf.addAll(_Esc.line(_divider()));
+    _labeled(buf, 'Waktu', _formatDateTime(handedAt));
+    _labeled(buf, 'Kasir', cashierName);
+    _labeled(buf, 'Izin (PIN)', authorizedBy);
+    if (assignedBy.trim().isNotEmpty) _labeled(buf, 'Ditetapkan', assignedBy);
+    if (notes.trim().isNotEmpty) _labeled(buf, 'Catatan', notes);
+    if (reprintedAt != null) _labeled(buf, 'Dicetak', _formatDateTime(reprintedAt));
+    buf.addAll(_Esc.line(_divider()));
+    buf.addAll(_Esc.feedLine(1));
+    buf.addAll(_Esc.line(_twoCols('Diserahkan oleh', 'Diterima oleh')));
+    buf.addAll(_Esc.feedLine(3));
+    buf.addAll(_Esc.line(_twoCols('(${_clean(cashierName)})', '(${_clean(recipient)})')));
+    buf.addAll(_Esc.feedLine(3));
+    buf.addAll(_Esc.cutPartial());
+    return Uint8List.fromList(buf);
+  }
+
+  /// "Label        : nilai", nilai panjang dibungkus dengan indentasi.
+  void _labeled(List<int> buf, String label, String value) {
+    const labelWidth = 13;
+    final prefix = '${label.padRight(labelWidth)}: ';
+    final width = paperWidth - prefix.length;
+    final lines = _wrapMenuName(_clean(value).isEmpty ? '-' : _clean(value), width > 8 ? width : 8);
+    buf.addAll(_Esc.line('$prefix${lines.first}'));
+    for (final more in lines.skip(1)) {
+      buf.addAll(_Esc.line('${' ' * prefix.length}$more'));
+    }
+  }
+
+  String _twoCols(String left, String right) {
+    final half = paperWidth ~/ 2;
+    String cut(String s) => s.length > half - 1 ? s.substring(0, half - 1) : s;
+    return cut(left).padRight(half) + cut(right);
+  }
+
+  /// Teks bebas dari pengguna/cloud: aman untuk encoder byte tunggal printer.
+  String _clean(String s) => String.fromCharCodes(
+          s.runes.map((rune) => rune > 0xff ? 0x3f : rune))
+      .replaceAll(RegExp(r'[\x00-\x1F\x7F-\x9F]'), ' ')
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .trim();
+
   // ── Private helpers ─────────────────────────────────────────────────────────
 
   void _addShiftMenuSummary(List<int> buf, Map<String, dynamic> report) {

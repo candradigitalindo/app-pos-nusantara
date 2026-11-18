@@ -32,7 +32,7 @@ class AppDatabase {
 
     return openDatabase(
       path,
-      version: 17,
+      version: 18,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
       onConfigure: _onConfigure,
@@ -208,6 +208,13 @@ class AppDatabase {
       await _addColumnIfMissing(db, 'sync_queue', 'error_kind', 'TEXT');
       await _addColumnIfMissing(db, 'cashier_shifts', 'closing_report', 'TEXT');
     }
+    if (oldVersion < 18) {
+      // Kas keluar "Bayar Pengadaan" (Kas Kasir Outlet) membawa id tugas cloud
+      // agar tautannya ikut terkirim ulang bila outbox dibangun kembali.
+      await db.execute(_cashMovementsSql);
+      await _addColumnIfMissing(
+          db, 'cashier_cash_movements', 'cash_payout_id', 'TEXT');
+    }
   }
 
   static Future<void> _addColumnIfMissing(
@@ -237,6 +244,19 @@ class AppDatabase {
       closing_report TEXT,
       created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  ''';
+
+  static const String _cashMovementsSql = '''
+    CREATE TABLE IF NOT EXISTS cashier_cash_movements (
+      id TEXT PRIMARY KEY,
+      shift_id TEXT NOT NULL,
+      movement_type TEXT NOT NULL CHECK (movement_type IN ('in', 'out')),
+      amount REAL NOT NULL,
+      counterpart_name TEXT NOT NULL,
+      note TEXT NOT NULL DEFAULT '',
+      cash_payout_id TEXT,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   ''';
 
@@ -602,17 +622,7 @@ class AppDatabase {
     await db.execute(_cashierShiftsSql);
 
     // Cashier Cash Movements
-    await db.execute('''
-      CREATE TABLE IF NOT EXISTS cashier_cash_movements (
-        id TEXT PRIMARY KEY,
-        shift_id TEXT NOT NULL,
-        movement_type TEXT NOT NULL CHECK (movement_type IN ('in', 'out')),
-        amount REAL NOT NULL,
-        counterpart_name TEXT NOT NULL,
-        note TEXT NOT NULL DEFAULT '',
-        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-      )
-    ''');
+    await db.execute(_cashMovementsSql);
 
     // Sync Queue
     await db.execute(_syncQueueSql);

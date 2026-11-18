@@ -87,8 +87,8 @@ void main() {
     await directory.delete(recursive: true);
   });
 
-  test('versi naik ke 17 dan kolom baru tersedia', () async {
-    expect((await db.rawQuery('PRAGMA user_version')).first.values.first, 17);
+  test('versi naik (≥17) dan kolom baru tersedia', () async {
+    expect((await db.rawQuery('PRAGMA user_version')).first.values.first, 18);
     final queueColumns = (await db.rawQuery('PRAGMA table_info(sync_queue)'))
         .map((c) => c['name']);
     final shiftColumns =

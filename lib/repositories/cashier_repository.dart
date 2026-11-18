@@ -302,9 +302,61 @@ class CashierRepository {
         'counterpart_name': movement.counterpartName,
         'note': movement.note,
         'created_at': _isoUtc(movement.createdAt),
+        // Penyerahan kas tugas "Bayar Pengadaan": cloud menautkan kas keluar
+        // ini ke pembayaran pengajuan (dibukukan sekali).
+        if (movement.isProcurementPayout) 'cash_payout_id': movement.cashPayoutId,
       },
       executor: executor,
     );
+  }
+
+  /// Kas keluar penyerahan "Bayar Pengadaan" dari laci shift berjalan.
+  /// [movementId] dibuat tablet SEBELUM klaim online, jadi pencatatan ulang
+  /// dengan id yang sama tidak menggandakan uang keluar (idempoten).
+  Future<CashMovement> recordProcurementPayout({
+    required String movementId,
+    required String payoutId,
+    required double amount,
+    required String recipient,
+    required String note,
+  }) async {
+    final db = await _db.database;
+    return db.transaction((txn) async {
+      final existing = await txn.query('cashier_cash_movements',
+          where: 'id = ?', whereArgs: [movementId], limit: 1);
+      if (existing.isNotEmpty) return CashMovement.fromMap(existing.first);
+      final shift = await getActiveShift(executor: txn);
+      if (shift == null) {
+        throw Exception('Buka kasir dulu — penyerahan kas dicatat di shift.');
+      }
+      final movement = CashMovement(
+        id: movementId,
+        shiftId: shift.id,
+        movementType: 'out',
+        amount: amount,
+        counterpartName: recipient,
+        note: note,
+        createdAt: _now(),
+        cashPayoutId: payoutId,
+      );
+      await txn.insert('cashier_cash_movements', movement.toMap());
+      await _enqueueCashMovement(movement, executor: txn);
+      return movement;
+    });
+  }
+
+  Future<CashMovement?> getCashMovement(String id) async {
+    final rows = await _db.query('cashier_cash_movements',
+        where: 'id = ?', whereArgs: [id], limit: 1);
+    return rows.isEmpty ? null : CashMovement.fromMap(rows.first);
+  }
+
+  /// Perkiraan uang di laci shift berjalan (sama dengan "Kas di Laci").
+  Future<double?> expectedDrawerCashNow() async {
+    final shift = await getActiveShift();
+    if (shift == null) return null;
+    final report = await getShiftReport(shift.id);
+    return (report['expected_cash'] as num?)?.toDouble();
   }
 
   /// Recover movements written by older versions before their outbox insert.

@@ -12,6 +12,7 @@ import '../services/cash_drawer_service.dart';
 import '../services/outlet_service.dart';
 import '../services/print_queue_service.dart';
 import '../services/printer_service.dart';
+import '../services/procurement_payout_service.dart';
 import '../services/receipt_builder.dart';
 
 /// State untuk CashierScreen
@@ -1337,6 +1338,57 @@ class CashierController extends ChangeNotifier {
       closedAt: shift.closedAt,
       reprint: true,
     );
+  }
+
+  /// Otorisasi PIN manajer/SVP untuk uang keluar laci "Bayar Pengadaan".
+  /// Mengembalikan nama pemberi izin, atau null bila PIN tidak berwenang.
+  Future<String?> payoutAuthorizer(String pin) => _voidAuthorizer(pin);
+
+  Future<String> currentCashierName() => _currentCashierName();
+
+  /// Cetak Bukti Penyerahan Kas tugas "Bayar Pengadaan".
+  /// Mengembalikan null bila masuk antrean cetak, atau pesan kesalahan.
+  Future<String?> printProcurementPayoutProof(CashPayout p,
+      {CashMovement? movement, bool reprint = false}) async {
+    try {
+      final outlet = await _outletService.loadOutlet();
+      final saved = await PrinterService().getSavedPrinters();
+      if (saved.isEmpty) {
+        return 'Belum ada printer tersimpan. Atur printer kasir di Pengaturan.';
+      }
+      final cashierPrinters =
+          saved.where((x) => x.hasRole(PrinterRole.cashier)).toList();
+      final printer = cashierPrinters.isNotEmpty
+          ? cashierPrinters.first
+          : saved.firstWhere((x) => !x.hasRole(PrinterRole.checker),
+              orElse: () => saved.first);
+      final cashier = p.cashierName.isNotEmpty
+          ? p.cashierName
+          : await _currentCashierName();
+      final bytes =
+          ReceiptBuilder(paperWidth: printer.paperCols).buildCashPayoutProof(
+        outletName: outlet.name.isNotEmpty ? outlet.name : 'POS Resto',
+        requestNumber: p.requestNumber,
+        vendorName: p.vendorName,
+        itemsSummary: p.itemsSummary,
+        recipient: p.recipientName,
+        amount: p.amount,
+        handedAt: movement?.createdAt ?? p.paidAt ?? p.claimedAt ?? DateTime.now(),
+        cashierName: cashier,
+        authorizedBy: p.authorizedBy,
+        assignedBy: p.assignedBy,
+        notes: p.notes,
+        reprintedAt: reprint ? DateTime.now() : null,
+      );
+      await PrintQueueService.instance.enqueueForPrinter(printer,
+          bytes: bytes,
+          label: reprint
+              ? 'BUKTI KAS ${p.requestNumber} (cetak ulang)'
+              : 'BUKTI KAS ${p.requestNumber}');
+      return null;
+    } catch (e) {
+      return 'Gagal mencetak bukti: ${e.toString().replaceFirst('Exception: ', '')}';
+    }
   }
 
   String _ordererName(Order order) =>

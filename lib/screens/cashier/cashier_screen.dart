@@ -9,6 +9,7 @@ import '../../repositories/order_repository.dart';
 import '../../services/app_events.dart';
 import '../../services/cash_drawer_service.dart';
 import '../../services/cloud_sync_service.dart';
+import '../../services/procurement_payout_service.dart';
 import '../../services/qris_service.dart';
 import '../../services/reservation_service.dart';
 import '../../services/sync_feedback.dart';
@@ -23,6 +24,7 @@ import '../../widgets/reservation_picker_dialog.dart';
 import '../../widgets/ui/ui.dart';
 import 'cashier_order_actions.dart';
 import 'cashier_widgets.dart';
+import 'procurement_payout_dialog.dart';
 import 'shift_period_summary.dart';
 import 'shift_reprint_dialogs.dart';
 
@@ -68,6 +70,9 @@ class _CashierScreenState extends State<CashierScreen>
     // Perbarui status segera setelah siklus sync (otomatis maupun manual)
     // selesai, tanpa menunggu poll 8-detik berikutnya.
     CloudSyncService.instance.syncing.addListener(_onSyncingChanged);
+    // Tugas Bayar Pengadaan dipantau langsung dari cloud selama layar kasir
+    // terbuka (bukan menunggu siklus sinkron).
+    ProcurementPayoutService.instance.startWatching();
     // Order/meja bisa berubah dari perangkat lain (station) atau layar lain
     // (waiter/dapur) — segarkan tanpa mengganggu keranjang yang sedang disusun.
     listenDataChanges();
@@ -101,6 +106,7 @@ class _CashierScreenState extends State<CashierScreen>
     cancelDataChanges();
     _syncTimer?.cancel();
     CloudSyncService.instance.syncing.removeListener(_onSyncingChanged);
+    ProcurementPayoutService.instance.stopWatching();
     _sync.dispose();
     _openShiftCtrl.dispose();
     _controller.dispose();
@@ -674,6 +680,24 @@ class _CashierScreenState extends State<CashierScreen>
     );
   }
 
+  /// Tugas "Bayar Pengadaan" (Kas Kasir Outlet) — data langsung dari cloud.
+  Future<void> _showProcurementPayouts() async {
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => ProcurementPayoutDialog(
+        service: ProcurementPayoutService.instance,
+        authorize: _controller.payoutAuthorizer,
+        cashierName: _controller.currentCashierName,
+        drawerCash: CashierRepository().expectedDrawerCashNow,
+        localMovement: CashierRepository().getCashMovement,
+        printProof: (p, m, reprint) =>
+            _controller.printProcurementPayoutProof(p, movement: m, reprint: reprint),
+      ),
+    );
+    if (mounted) _controller.loadData();
+  }
+
   /// Daftar shift yang sudah ditutup → pilih untuk cetak ulang laporannya.
   Future<void> _showClosedShiftPicker() async {
     await showDialog<void>(
@@ -784,6 +808,37 @@ class _CashierScreenState extends State<CashierScreen>
             label: 'Kas',
             onTap: () => _showCashMovementDialog('in'),
             width: w),
+        // Tugas "Bayar Pengadaan" dari Bagian Keuangan — hanya muncul bila ada.
+        ValueListenableBuilder<int>(
+          valueListenable: ProcurementPayoutService.instance.openCount,
+          builder: (_, count, __) => count == 0
+              ? const SizedBox.shrink()
+              : Row(mainAxisSize: MainAxisSize.min, children: [
+                  _groupDivider(),
+                  Stack(clipBehavior: Clip.none, children: [
+                    _headerBtn(
+                        icon: Icons.payments_outlined,
+                        label: 'Bayar Pengadaan',
+                        onTap: _showProcurementPayouts,
+                        width: w),
+                    Positioned(
+                      top: 4,
+                      right: 8,
+                      child: Container(
+                        key: const Key('payout-badge'),
+                        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                        decoration: BoxDecoration(
+                          color: AppColors.danger,
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Text('$count',
+                            style: const TextStyle(
+                                color: Colors.white, fontSize: 10, fontWeight: FontWeight.w800)),
+                      ),
+                    ),
+                  ]),
+                ]),
+        ),
         _groupDivider(),
         _headerBtn(
             icon: Icons.point_of_sale_outlined,

@@ -1,4 +1,4 @@
-// Verifikasi migrasi DB v10 → v17 terhadap SQLITE ASLI berisi data.
+// Verifikasi migrasi DB v10 → v18 terhadap SQLITE ASLI berisi data.
 //
 // Migrasi-migrasi ini menyentuh tabel yang sudah dipakai di lapangan:
 //
@@ -48,9 +48,9 @@ void main() {
     await testDirectory.delete(recursive: true);
   });
 
-  test('versi skema naik ke 17', () async {
+  test('versi skema naik ke 18', () async {
     final versi = (await db.rawQuery('PRAGMA user_version')).first.values.first;
-    expect(versi, 17);
+    expect(versi, 18);
   });
 
   test('migrasi v17 melengkapi outbox & shift walau tabelnya belum ada',
@@ -61,6 +61,8 @@ void main() {
             .toSet();
     expect(await columns('sync_queue'), contains('error_kind'));
     expect(await columns('cashier_shifts'), contains('closing_report'));
+    // v18: kas keluar Bayar Pengadaan membawa id tugas cloud.
+    expect(await columns('cashier_cash_movements'), contains('cash_payout_id'));
   });
 
   test('migrasi v16 menjaga data dan jenis item historis tetap tidak diketahui',
